@@ -15,4 +15,6 @@ enum Settings {
 
     static var backdropOpacity: Double { min(max(defaults.double(forKey: "backdropOpacity"), 0.3), 1.0) }
     static var backdropStyle: String { defaults.string(forKey: "backdropStyle") ?? "dim" }
+    /// "navigate" (wheel = next/previous) or "zoom" (wheel zooms at the cursor).
+    static var scrollWheelAction: String { defaults.string(forKey: "scrollWheelAction") ?? "navigate" }
 }

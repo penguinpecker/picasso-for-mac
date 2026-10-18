@@ -28,11 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
-    /// Opens a file, or a folder at its first image. Reuses the one viewer window.
+    /// Opens a file within its folder, or a folder at its first image. Reuses the one viewer window.
     func open(_ url: URL) {
         didOpen = true
-        let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-        guard let image = isFolder ? FolderIndex.images(in: url).first : url else {
+        guard let (images, index) = FolderIndex.open(url) else {
             // Empty folder: ask again on a later turn. Never modally inside an odoc handler: at launch it runs
             // before applicationDidFinishLaunching (no main menu yet), and it would hold the sender's reply.
             if viewer == nil && panel == nil { perform(#selector(showOpenPanel), with: nil, afterDelay: 0) }
@@ -42,7 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // swallowing the viewer's clicks and keys. Not a callout of the modal loop, so abort, not stop.
         if panel != nil { NSApp.abortModal() }
         if viewer == nil { viewer = ViewerController() }
-        viewer?.show(image)
+        viewer?.show(images, at: index)
     }
 
     /// First existing path in argv, skipping flags and the values of -NS*/-Apple* flags.

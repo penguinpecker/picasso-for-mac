@@ -65,14 +65,17 @@ write([stored.makeImage()!], "04-exif6.jpg", .jpeg, frame: jpeg.merging([kCGImag
 write([draw(2400, 1600, "5", "2400×1600 HEIC", hue: 0.95)], "05-photo.heic", .heic, frame: jpeg)
 
 // ImageIO can't encode WebP; go through cwebp (fixture generation only).
-write([draw(1600, 1200, "6", "1600×1200 WebP", hue: 0.15)], "06-photo.png", .png, in: scratch)
-let cwebp = Process()
-cwebp.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/cwebp")
-cwebp.arguments = ["-quiet", "-q", "85", scratch.appendingPathComponent("06-photo.png").path,
-                   "-o", out.appendingPathComponent("06-photo.webp").path]
-try! cwebp.run()
-cwebp.waitUntilExit()
-precondition(cwebp.terminationStatus == 0, "cwebp failed")
+func writeWebP(_ image: CGImage, _ name: String, in dir: URL = out) {
+    let png = (name as NSString).deletingPathExtension + ".png"
+    write([image], png, .png, in: scratch)
+    let cwebp = Process()
+    cwebp.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/cwebp")
+    cwebp.arguments = ["-quiet", "-q", "85", scratch.appendingPathComponent(png).path, "-o", dir.appendingPathComponent(name).path]
+    try! cwebp.run()
+    cwebp.waitUntilExit()
+    precondition(cwebp.terminationStatus == 0, "cwebp failed")
+}
+writeWebP(draw(1600, 1200, "6", "1600×1200 WebP", hue: 0.15), "06-photo.webp")
 
 write([draw(1500, 1000, "7", "1500×1000 TIFF", hue: 0.5)], "07-photo.tiff", .tiff)
 write([draw(1200, 900, "8", "1200×900 BMP", hue: 0.66)], "08-photo.bmp", .bmp)
@@ -91,5 +94,25 @@ CGImageDestinationAddImage(heif, draw(800, 600, "✕", "decoy item 0", hue: 0.4)
 CGImageDestinationAddImage(heif, draw(1200, 1800, "11", "HEIC primary item 1", hue: 0.85),
                            [kCGImagePropertyPrimaryImage: true] as CFDictionary)
 precondition(CGImageDestinationFinalize(heif), "failed to write 11-primary.heic")
+
+// Folder navigation: Finder name order, hidden files, non-images, a text file named .jpg and a subfolder.
+// Each image has its own size, so a test can tell from the layout alone which one is shown.
+let nav = out.appendingPathComponent("nav", isDirectory: true)
+try! FileManager.default.createDirectory(at: nav.appendingPathComponent("sub"), withIntermediateDirectories: true)
+let navImages: [(String, UTType)] = [
+    ("img1.jpg", .jpeg), ("img2.jpg", .jpeg), ("img10.jpg", .jpeg), ("IMG_0003.JPG", .jpeg), ("Photo (2).png", .png),
+    ("Photo (10).png", .png), ("éclair.heic", .heic), ("Zebra.webp", .webP),
+    (".hidden.jpg", .jpeg), ("flagged.jpg", .jpeg), ("sub/inner.jpg", .jpeg), // must not be listed
+]
+for (i, (name, type)) in navImages.enumerated() {
+    let image = draw(1200 + 40 * i, 800 + 20 * i, "N\(i + 1)", name, hue: CGFloat(i) / CGFloat(navImages.count))
+    if type == .webP { writeWebP(image, name, in: nav) } else { write([image], name, type, in: nav, frame: jpeg) }
+}
+var flagged = nav.appendingPathComponent("flagged.jpg")
+var hidden = URLResourceValues()
+hidden.isHidden = true // the Finder "hidden" flag (UF_HIDDEN), not a dot name
+try! flagged.setResourceValues(hidden)
+try! "notes\n".write(to: nav.appendingPathComponent("notes.txt"), atomically: false, encoding: .utf8)
+try! "not an image\n".write(to: nav.appendingPathComponent("fake.jpg"), atomically: false, encoding: .utf8)
 
 print("fixtures written to \(out.path)")

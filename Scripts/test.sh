@@ -10,8 +10,9 @@ BUILD="$ROOT/build"
 FIX="$BUILD/fixtures"
 OUT="$BUILD/test-results"
 LOCK="$BUILD/.gui-lock"
-ALL=(window screen2 fit exif formats large blur click esc cmdw cmdq activate argv odoc folder panel emptyfolder odocempty
-     panelodoc corrupt rapid screenchange)
+ALL=(window screen2 fit exif formats large blur opacity click edgeclick esc escearly cmdw cmdq activate argv odoc folder
+     panel emptyfolder odocempty panelodoc corrupt rapid screenchange index keys wheel stale secondopen
+     zoomkeys zoompoint zoommode pan rotate dblclick bar slideshow autohide label)
 mkdir -p "$BUILD" "$OUT"
 
 # One GUI run at a time (stale locks from dead processes are reclaimed).
@@ -40,14 +41,16 @@ APP="$("$ROOT/Scripts/build.sh" selftest)" || { echo "BUILD FAILED"; exit 1; }
 BIN="$APP/Contents/MacOS/Lightbox"
 
 # Files outside the read-only-checked fixtures: LaunchServices stamps com.apple.lastuseddate#PS on
-# documents it opens, so LaunchServices scenarios get a copy; plus a non-image named like a JPEG.
+# documents it opens, so LaunchServices scenarios get a copy; plus a non-image named like a JPEG
+# and a symlink to the nav folder.
 LS_FILE="$BUILD/fixtures-ls/01-landscape.jpg"
-rm -rf "$BUILD/fixtures-ls" "$BUILD/fixtures-bad" "$BUILD/empty-folder"
+rm -rf "$BUILD/fixtures-ls" "$BUILD/fixtures-bad" "$BUILD/empty-folder" "$BUILD/nav-link"
 mkdir -p "$BUILD/fixtures-ls" "$BUILD/fixtures-bad" "$BUILD/empty-folder"
 cp -X "$FIX/01-landscape.jpg" "$LS_FILE"
 printf 'not an image\n' > "$BUILD/fixtures-bad/broken.jpg"
+ln -s "$FIX/nav" "$BUILD/nav-link"
 
-snapshot() { find "$FIX" -type f -exec stat -f '%N %z %m %c' {} + | sort; xattr -lr "$FIX"; }
+snapshot() { find "$FIX" -type f -exec stat -f '%N %z %m %c' {} + | sort; find "$FIX" -type f -exec shasum -a 256 {} + | sort; xattr -lr "$FIX"; }
 BEFORE="$(snapshot)"
 
 if [ $# -gt 0 ]; then SCENARIOS=("$@"); else SCENARIOS=("${ALL[@]}"); fi
@@ -58,7 +61,11 @@ for s in "${SCENARIOS[@]}"; do
     exif)   ARGS=("$FIX/04-exif6.jpg") ;;
     large)  ARGS=("$FIX/10-huge.jpg") ;;
     blur)   ARGS=(-backdropStyle blur "$L") ;;
-    folder) ARGS=("$FIX") ;;
+    opacity) ARGS=(-backdropOpacity 0.1 "$L") ;;
+    folder|keys|wheel|slideshow|label) ARGS=("$FIX/nav") ;;
+    zoommode) ARGS=(-scrollWheelAction zoom "$L") ;;
+    autohide) ARGS=("$FIX/02-portrait.jpg") ;;
+    index)  ARGS=("$FIX/nav/img1.jpg") ;;
     panel|panelodoc) ARGS=() ;;
     odoc)   LS_ARG="$LS_FILE" ;;
     odocempty) LS_ARG="$BUILD/empty-folder" ;;
@@ -66,7 +73,7 @@ for s in "${SCENARIOS[@]}"; do
     emptyfolder) ARGS=("$BUILD/empty-folder") ;;
     *)      ARGS=("$L") ;;
   esac
-  rm -f "$OUT/$s".* "$OUT/$s"-*
+  rm -rf "$OUT/$s".* "$OUT/$s"-*
   start=$(date +%s)
   if [ -n "$LS_ARG" ]; then
     # Through LaunchServices like Finder (-g: stay in the background, -W: wait for exit).
@@ -78,6 +85,8 @@ for s in "${SCENARIOS[@]}"; do
       perl -e 'alarm shift; exec @ARGV' 30 "$BIN" ${ARGS[@]+"${ARGS[@]}"} > "$OUT/$s.log" 2>&1
   fi
   rc=$?
+  # The alarm kills `open -W`, not the app LaunchServices started: never leave a hung test window up.
+  [ $rc -ne 0 ] && pkill -f "$BIN"
   verdict="$(plutil -extract pass raw -o - "$OUT/$s.json" 2>/dev/null)"
   if [ $rc -eq 0 ] && [ "$verdict" = true ]; then
     PASSED=$((PASSED + 1)); echo "PASS  $s ($(( $(date +%s) - start ))s)"
@@ -88,7 +97,7 @@ for s in "${SCENARIOS[@]}"; do
 done
 
 if [ "$BEFORE" = "$(snapshot)" ]; then
-  echo "PASS  fixtures untouched (size/mtime/ctime/xattrs)"; PASSED=$((PASSED + 1))
+  echo "PASS  fixtures untouched (size/mtime/ctime/SHA-256/xattrs)"; PASSED=$((PASSED + 1))
 else
   echo "FAIL  fixtures were modified"; FAILED+=(read-only)
 fi
