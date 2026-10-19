@@ -4,7 +4,7 @@
 
 # Picasso for Mac
 
-**A fast, free, open-source fullscreen photo viewer for macOS.**
+**A fast, free, open-source fullscreen photo viewer for macOS: a Picasa Photo Viewer alternative for Mac.**
 Double-click a photo and it opens over your desktop on a dimmed backdrop. No library, no import, no window chrome.
 Arrow keys go through the whole folder, and a click anywhere outside the photo closes it.
 
@@ -13,12 +13,15 @@ Arrow keys go through the whole folder, and a click anywhere outside the photo c
 ![Swift](https://img.shields.io/badge/Swift-AppKit-F05138?logo=swift&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-2EA44F)
 ![Read-only](https://img.shields.io/badge/never%20modifies%20files-✓-2EA44F)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+
+**[⬇ Download the latest release](https://github.com/penguinpecker/picasso-for-mac/releases/latest)**
 
 </div>
 
 ---
 
-Picasso is a lightweight **image viewer for Mac**. It takes over the screen your cursor is on and lets the desktop show through a translucent dark (or blurred) backdrop, then fits your photo in the middle. It opens instantly, keeps up when you hold an arrow key through a folder of thousands of photos, and **never writes to your files**. Viewing only: no editing, no catalog, no account.
+If you miss the old **Picasa Photo Viewer** (photos opening over a dimmed desktop, big arrows, a filmstrip at the bottom, click-outside-to-close), this is that experience, rebuilt natively for the Mac. Picasso is a lightweight **image viewer for Mac**. It takes over the screen your cursor is on and lets the desktop show through a translucent dark (or blurred) backdrop, then fits your photo in the middle. It opens instantly, keeps up when you hold an arrow key through a folder of thousands of photos, and **never writes to your files**. Viewing only: no editing, no catalog, no account.
 
 It's a native Swift + AppKit app with **zero third-party dependencies**: Apple's ImageIO for decoding, Core Animation for drawing. It builds as a universal binary for Apple Silicon and Intel Macs on macOS Sonoma 14 or later.
 
@@ -56,6 +59,17 @@ JPEG · PNG · HEIC / HEIF · WebP · GIF (animated) · TIFF · BMP · **RAW** (
 Hold <kbd>→</kbd> to go through a folder: the viewer shows a preview for every step and loads full quality where you stop.
 
 ## Install
+
+### Download (easiest)
+
+1. Download **Picasso.zip** from the [latest release](https://github.com/penguinpecker/picasso-for-mac/releases/latest) and unzip it.
+2. Drag **Picasso.app** into **Applications**.
+3. The app is open source and isn't notarized by Apple, so the first time you open it macOS asks you to confirm. Open it once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Or run this in Terminal:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Picasso.app
+   ```
+
+### Build from source
 
 You need macOS 14 Sonoma or later and Apple's Command Line Tools (`xcode-select --install`). Full Xcode is optional.
 
@@ -103,7 +117,7 @@ Press <kbd>⌘</kbd>+<kbd>,</kbd> while viewing. Changes apply immediately.
 
 **How is this different from Preview or Quick Look?** Preview opens photos in a window, and Quick Look doesn't let you keep browsing a folder. Picasso is a fullscreen, keyboard-first way to flip through a folder of photos over your desktop, and close it with one click.
 
-## Build from source
+## Development
 
 ```bash
 Scripts/build.sh            # release, universal  → build/Picasso.app
@@ -127,10 +141,16 @@ Picasso/
   SelfTest.swift                  test harness (compiled only into the test build)
 ```
 
+## License
+
+[MIT](LICENSE). Free to use, change and share.
+
 ## Uninstall
 
 Drag `/Applications/Picasso.app` to the Trash. To also remove its settings, run `defaults delete com.penguinpecker.Picasso`.
 
 ---
 
-<sub>Keywords: fullscreen photo viewer for Mac, fast image viewer macOS, lightweight picture viewer, open-source image viewer for macOS Sonoma and Sequoia, HEIC viewer, WebP viewer for Mac, RAW photo viewer, slideshow app for Mac, Finder default image viewer.</sub>
+<sub>Keywords: Picasa Photo Viewer for Mac, Picasa alternative for macOS, Picasa viewer replacement, fullscreen photo viewer for Mac, fast image viewer macOS, lightweight picture viewer, open-source image viewer for macOS Sonoma and Sequoia, HEIC viewer, WebP viewer for Mac, RAW photo viewer, slideshow app for Mac, Finder default image viewer.</sub>
+
+<sub>Picasa is a trademark of Google LLC. Picasso for Mac is an independent project, not affiliated with or endorsed by Google.</sub>
