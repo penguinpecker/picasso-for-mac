@@ -1,6 +1,7 @@
 import AppKit
 
-/// The HUD over the image: name/position pill, bottom bar, and edge arrows that appear when the pointer nears an edge.
+/// The HUD over the image: name/position pill, bottom bar, thumbnail strip above it (unless turned off in Settings), and
+/// edge arrows that appear when the pointer nears an edge.
 /// Everything hides together after `hideDelay` without mouse movement. Only visible controls take clicks; the rest
 /// of the overlay is transparent to the mouse, so the canvas below gets backdrop clicks, drags and double-clicks.
 @MainActor
@@ -11,16 +12,18 @@ final class ControlsOverlay: NSView {
     let fit: HUDButton, play: HUDButton, leftArrow: HUDButton, rightArrow: HUDButton
     let zoomSlider = HUDSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     let label = NSTextField(labelWithString: "")
-    let pill = hudSurface(radius: 14), bar = hudSurface(radius: 14)
+    let pill = hudSurface(radius: 14), bar = hudSurface(radius: 14), stripSurface = hudSurface(radius: 14)
+    let strip = ThumbnailStrip()
     let leftCircle = hudSurface(radius: 32), rightCircle = hudSurface(radius: 32)
     /// The fading elements, and whether each is currently meant to be visible (and clickable).
-    private lazy var elements = [pill, bar, leftCircle, rightCircle]
-    private var visible = [false, false, false, false]
+    private lazy var elements = [pill, bar, stripSurface, leftCircle, rightCircle]
+    private var visible = [false, false, false, false, false]
 
     private(set) var isShown = false
     /// The last pointer position seen, in this view's coordinates.
     private var mouse: NSPoint?
     private var hideTimer: Timer?
+    private var thumbnailsSetting: NSKeyValueObservation?
 
     init(target: ViewerController) {
         func button(_ symbol: String, _ tip: String, _ action: Selector) -> HUDButton {
@@ -54,6 +57,10 @@ final class ControlsOverlay: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 7, left: 10, bottom: 7, right: 10)
         stack.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(stack)
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        strip.onSelect = { [weak target] in target?.go(to: $0) }
+        stripSurface.addSubview(strip)
+        stripSurface.isHidden = !Settings.showThumbnails
         for (circle, arrow) in [(leftCircle, leftArrow), (rightCircle, rightArrow)] {
             arrow.translatesAutoresizingMaskIntoConstraints = false
             circle.addSubview(arrow)
@@ -73,7 +80,6 @@ final class ControlsOverlay: NSView {
             label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -14),
             label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
             label.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.5),
-            // The thumbnail strip goes between the bar and the image area, above the bar.
             bar.centerXAnchor.constraint(equalTo: centerXAnchor),
             bar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -28),
             stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
@@ -81,6 +87,14 @@ final class ControlsOverlay: NSView {
             stack.topAnchor.constraint(equalTo: bar.topAnchor),
             stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
             zoomSlider.widthAnchor.constraint(equalToConstant: 120),
+            // Above the bar, as wide as its thumbnails up to 60% of the screen.
+            stripSurface.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stripSurface.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: -10),
+            stripSurface.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.6),
+            strip.leadingAnchor.constraint(equalTo: stripSurface.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: stripSurface.trailingAnchor),
+            strip.topAnchor.constraint(equalTo: stripSurface.topAnchor),
+            strip.bottomAnchor.constraint(equalTo: stripSurface.bottomAnchor),
             leftCircle.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
             rightCircle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
         ])
@@ -91,6 +105,10 @@ final class ControlsOverlay: NSView {
         // Always active: the pointer is tracked even when another app is frontmost.
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self))
+        // Live, also for `defaults write` from outside the app: KVO hears other processes, didChangeNotification doesn't.
+        thumbnailsSetting = UserDefaults.standard.observe(\.showThumbnails) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.settingsChanged() }
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -130,7 +148,7 @@ final class ControlsOverlay: NSView {
     }
 
     @objc private func hideIfIdle() {
-        // Not while the pointer rests on the bar or a visible arrow.
+        // Not while the pointer rests on the bar, the strip or a visible arrow.
         if let mouse, zip(elements, visible).dropFirst().contains(where: { $1 && $0.frame.contains(mouse) }) { return wake() }
         hide()
     }
@@ -147,6 +165,13 @@ final class ControlsOverlay: NSView {
         #endif
     }
 
+    private func settingsChanged() {
+        let hidden = !Settings.showThumbnails
+        guard stripSurface.isHidden != hidden else { return }
+        stripSurface.isHidden = hidden
+        apply()
+    }
+
     /// Name and position for the pill, and which way there is somewhere to go.
     func update(name: String, index: Int, count: Int) {
         let text = NSMutableAttributedString(string: name, attributes: [
@@ -161,8 +186,10 @@ final class ControlsOverlay: NSView {
         rightArrow.isEnabled = next.isEnabled
     }
 
-    func showZoom(position: Double, isFit: Bool, zoomedIn: Bool) {
+    /// `canToggle` is false when fit already is 100%: the fit / actual size button has nothing to switch to.
+    func showZoom(position: Double, isFit: Bool, zoomedIn: Bool, canToggle: Bool) {
         zoomSlider.doubleValue = position
+        fit.isEnabled = canToggle
         if isFit { fit.setSymbol("1.magnifyingglass", tip: "Actual Size") } else {
             fit.setSymbol(zoomedIn ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right", tip: "Fit to Screen")
         }
@@ -172,10 +199,10 @@ final class ControlsOverlay: NSView {
         play.setSymbol(playing ? "pause.fill" : "play.fill", tip: playing ? "Pause Slideshow" : "Play Slideshow")
     }
 
-    /// Fades each element to its target visibility: everything when shown, an arrow only near its edge.
+    /// Fades each element to its target visibility: everything when shown (the strip if enabled), an arrow only near its edge.
     private func apply() {
         let edge = mouse.map { $0.x < bounds.width * 0.15 ? -1 : $0.x > bounds.width * 0.85 ? 1 : 0 } ?? 0
-        let targets = [isShown, isShown, isShown && edge == -1, isShown && edge == 1]
+        let targets = [isShown, isShown, isShown && !stripSurface.isHidden, isShown && edge == -1, isShown && edge == 1]
         for (view, (old, new)) in zip(elements, zip(visible, targets)) where old != new {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.3

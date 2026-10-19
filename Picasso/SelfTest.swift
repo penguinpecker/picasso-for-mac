@@ -1,9 +1,10 @@
 #if SELFTEST
 import AppKit
+import UniformTypeIdentifiers
 
 /// In-process scenario runner, compiled only into the test build (-D SELFTEST).
-/// LIGHTBOX_SELFTEST=<scenario> picks a scenario; it drives the real event paths, asserts on live state,
-/// writes <scenario>.json to LIGHTBOX_SELFTEST_OUT and exits 0 (pass) or 1 (fail).
+/// PICASSO_SELFTEST=<scenario> picks a scenario; it drives the real event paths, asserts on live state,
+/// writes <scenario>.json to PICASSO_SELFTEST_OUT and exits 0 (pass) or 1 (fail).
 @MainActor
 enum SelfTest {
     // Hooks set by product code.
@@ -12,6 +13,11 @@ enum SelfTest {
     static var decodeCallbacks = 0
     static var scrollEvents = 0
     static var cursorHides = 0
+    /// Thumbnail decodes queued, decodes delivered (cancelled ones never are), and cells served from the cache.
+    static var thumbRequests = 0 { didSet { if oldValue == 0 { firstThumbRequest = now } } }
+    static var thumbLoads = 0 { didSet { lastThumbLoad = now } }
+    static var thumbHits = 0
+    private static var firstThumbRequest = 0.0, lastThumbLoad = 0.0
     private static var sentScrolls = 0
     /// Set when the viewer puts a decode on screen. Anything shown that isn't the current image is stale.
     static var shownURL: URL? {
@@ -22,6 +28,15 @@ enum SelfTest {
     }
     private static var shownCount = 0
     private static var staleShown: [String] = []
+    /// Fast thumbnails put on screen while flying (stale ones are recorded too), and decodes that arrived stale.
+    static var previews = 0
+    static var staleDropped = 0
+    /// Screen-size decodes run, by file.
+    static var screenDecodes: [URL: Int] = [:]
+    static func previewShown(_ url: URL) {
+        previews += 1
+        if url != viewer?.currentURL { staleShown.append("preview " + url.lastPathComponent) }
+    }
     /// Window alpha (-1 if not on screen) and time right after present() orders the window front.
     private static var presentAlpha = -1.0
     private static var presentTime = 0.0
@@ -31,9 +46,9 @@ enum SelfTest {
     }
 
     private static let env = ProcessInfo.processInfo.environment
-    private static let scenario = env["LIGHTBOX_SELFTEST"] ?? ""
-    private static let outDir = URL(fileURLWithPath: env["LIGHTBOX_SELFTEST_OUT"] ?? NSTemporaryDirectory())
-    private static let fixtures = URL(fileURLWithPath: env["LIGHTBOX_FIXTURES"] ?? "")
+    private static let scenario = env["PICASSO_SELFTEST"] ?? ""
+    private static let outDir = URL(fileURLWithPath: env["PICASSO_SELFTEST_OUT"] ?? NSTemporaryDirectory())
+    private static let fixtures = URL(fileURLWithPath: env["PICASSO_FIXTURES"] ?? "")
     private static weak var app: AppDelegate?
     /// NSEvent.mouseLocation in the screen2 scenario.
     private static var fakeMouse = NSPoint.zero
@@ -45,8 +60,19 @@ enum SelfTest {
 
     static func install(_ delegate: AppDelegate) {
         guard !scenario.isEmpty else { return }
+        // test.sh preflight: with the display asleep or the session locked, every GUI scenario would fail for no reason.
+        if scenario == "preflight" {
+            let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
+            let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
+            let onConsole = session["kCGSSessionOnConsoleKey"] as? Bool ?? false
+            let locked = session["CGSSessionScreenIsLocked"] as? Bool ?? false
+            print("display asleep: \(asleep), session on console: \(onConsole), screen locked: \(locked)")
+            exit(asleep || !onConsole || locked ? 2 : 0)
+        }
         app = delegate
         launchTime = now
+        // The thumbs scenario turns this off; a run killed before it cleaned up must not leave it off for the next.
+        UserDefaults.standard.removeObject(forKey: "showThumbnails")
         // screen2: pretend the cursor is on the last screen before the viewer is created (the scenario moves it later).
         // autohide: start where it really is, then move it off the viewer.
         if ["screen2", "autohide"].contains(scenario), let target = NSScreen.screens.last,
@@ -64,12 +90,19 @@ enum SelfTest {
             }
             method_setImplementation(m, imp_implementationWithBlock(block))
         }
-        // The owner may be using the machine: real pointer input must not steer a scenario. Synthesized events go
-        // straight to window.sendEvent, or through the queue tagged with `synthetic` (button tracking loops need that).
+        // The owner may be using the machine: real pointer and keyboard input must not steer a scenario (a real click
+        // on the viewer activates the app, then real keys reach it). Synthesized events go straight to
+        // window.sendEvent, or through the queue tagged with `synthetic` (button tracking loops need that), or are
+        // keys sent through NSApp by sendKey.
         NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .mouseEntered, .mouseExited, .leftMouseDown, .leftMouseUp,
                                                     .leftMouseDragged, .rightMouseDown, .rightMouseUp, .otherMouseDown,
-                                                    .otherMouseUp, .scrollWheel, .magnify, .swipe, .rotate]) { event in
-            [.leftMouseDown, .leftMouseUp, .leftMouseDragged].contains(event.type) && event.eventNumber == synthetic ? event : nil
+                                                    .otherMouseUp, .scrollWheel, .magnify, .swipe, .rotate,
+                                                    .keyDown, .keyUp, .flagsChanged]) { event in
+            let pass = MainActor.assumeIsolated {
+                event.type == .keyDown ? sendingKey
+                    : [.leftMouseDown, .leftMouseUp, .leftMouseDragged].contains(event.type) && event.eventNumber == synthetic
+            }
+            return pass ? event : nil
         }
         print("argv \(CommandLine.arguments) cwd \(FileManager.default.currentDirectoryPath)")
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
@@ -122,6 +155,11 @@ enum SelfTest {
         case "slideshow": await slideshowScenario()
         case "autohide": await autoHideScenario()
         case "label": await labelScenario()
+        case "strip": await stripScenario()
+        case "thumbs": await thumbsScenario()
+        case "fly": await flyScenario()
+        case "flypng", "flypnghidden": await flyPNGScenario()
+        case "gif": await gifScenario()
         default: check("known scenario", false, scenario)
         }
         finish()
@@ -212,6 +250,36 @@ enum SelfTest {
             checkBands(image, "exif6")
         } else { check("decoded image present", false, nil) }
         screenshot("exif")
+        // The full-resolution path turns the stored pixels itself: each orientation must come out as ImageIO's thumbnail
+        // path turns it, in JPEG (EXIF), HEIC (irot/imir boxes) and RAW (DNG, through ImageIO's RAW engine), at full size
+        // and scaled down as over the 400 MB cap (orient/o1–o8: one 300×200 picture, red, green over blue, yellow).
+        func quadrants(_ d: Decoded?) -> [String] {
+            guard let i = d?.image else { return [] }
+            return [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)].map { classify(pixel(i, x: $0, yFromTop: $1)) }
+        }
+        for ext in ["jpg", "heic", "dng"] {
+            var looks: Set<[String]> = []
+            for o in 1...8 {
+                let url = fixtures.appendingPathComponent("orient/o\(o).\(ext)")
+                for size in [16384, 150] {
+                    let (theirs, ours) = await Task.detached {
+                        (ImageLoader.decode(url, maxPixelSize: size, colorSpace: nil),
+                         ImageLoader.decode(url, maxPixelSize: size, colorSpace: nil, full: true))
+                    }.value
+                    let a = quadrants(theirs), b = quadrants(ours)
+                    if size > 150 { looks.insert(a) }
+                    check("o\(o).\(ext) \(size > 150 ? "full size" : "scaled"): full-resolution path \(b) "
+                          + "\(ours.map { "\($0.image.width)x\($0.image.height)" } ?? "-") like ImageIO's",
+                          a.count == 4 && a == b && Set(a).count == 4 && ours?.image.width == theirs?.image.width
+                          && ours?.image.height == theirs?.image.height && ours?.pixelSize == theirs?.pixelSize
+                          && ours.map { max($0.image.width, $0.image.height) } == min(size, 300), a)
+                }
+            }
+            check("the 8 .\(ext) orientations all look different (each file carries its own)", looks.count == 8, looks.count)
+        }
+        let raw = CGImageSourceCreateWithURL(fixtures.appendingPathComponent("orient/o6.dng") as CFURL, nil).flatMap(CGImageSourceGetType)
+        check("the .dng fixtures decode through ImageIO's RAW path", (raw as String?).flatMap(UTType.init)?.conforms(to: .rawImage) == true,
+              raw)
     }
 
     /// A6: every format decodes and shows its content upright.
@@ -223,13 +291,33 @@ enum SelfTest {
             ("07-photo.tiff", CGSize(width: 1500, height: 1000)), ("08-photo.bmp", CGSize(width: 1200, height: 900)),
             ("09-anim.gif", CGSize(width: 600, height: 400)), ("11-primary.heic", CGSize(width: 1200, height: 1800)),
         ]
+        let screen = v.window.screen!, screenPixels = Int(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor)
         for (name, size) in cases {
             guard await open(name, size: size), let image = currentImage(v) else { check("\(name) displays", false, nil); continue }
             let f = v.canvas.imageLayer.frame
+            // 11-primary.heic: ImageIO's thumbnail of a HEIF primary that isn't item 0 stops at item 0's 800 px.
+            let wanted = min(screenPixels, Int(max(size.width, size.height)))
+            check("\(name): decoded at full screen size (long edge \(wanted))", max(image.width, image.height) == wanted,
+                  "\(image.width)x\(image.height)")
             check("\(name): decoded \(image.width)x\(image.height), shown \(Int(f.width))x\(Int(f.height)) pt",
                   image.width > 0 && f.width > 0 && abs(f.width / f.height - size.width / size.height) < 0.01, nil)
+            check("\(name): through the pipeline (the cached screen-size decode is what is shown)",
+                  v.shown != nil && v.shown === v.loader.cache.object(forKey: v.currentURL! as NSURL) && v.shown?.image === image, nil)
             checkBands(image, name)
         }
+        // RAW (no fixture): a file named with any camera-raw type's extension that ImageIO decodes is listed.
+        let raws = (CGImageSourceCopyTypeIdentifiers() as? [String] ?? []).compactMap { UTType($0) }.filter { $0.conforms(to: .rawImage) }
+        let exts = Set(raws.flatMap { $0.tags[.filenameExtension] ?? [] })
+        let dir = outDir.appendingPathComponent("formats-raw-names")
+        try? FileManager.default.removeItem(at: dir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for ext in exts { FileManager.default.createFile(atPath: dir.appendingPathComponent("x.\(ext)").path, contents: Data()) }
+        let listed = Set(FolderIndex.images(in: dir).map(\.pathExtension))
+        values["rawExtensions"] = exts.sorted()
+        check("RAW: ImageIO reports camera-raw types (\(raws.count))", raws.count > 10 && exts.isSuperset(of: ["cr2", "cr3", "nef", "arw", "dng", "raf"]),
+              raws.map(\.identifier))
+        check("RAW: every one of their \(exts.count) extensions is listed", listed == exts, exts.subtracting(listed).sorted())
+        try? FileManager.default.removeItem(at: dir)
     }
 
     /// A7: huge image decoded off-main (dispatchPrecondition in ImageLoader.decode) at <= screen pixels.
@@ -248,6 +336,79 @@ enum SelfTest {
         let shownPixels = v.canvas.imageLayer.frame.width * screen.backingScaleFactor
         check("decoded >= displayed pixels at fit", CGFloat(image.width) >= shownPixels - 1, "\(image.width) vs \(shownPixels)")
         checkBands(image, "huge")
+
+        // E4: zoomed in to 100%, the full-resolution decode is swapped in off the main thread and stays.
+        let c = v.canvas, w = v.window, screenDecode = v.shown
+        v.controls.hide()
+        await sleep(0.4)
+        startHeartbeat()
+        let t0 = now
+        press(18, "1", [], w)
+        let swapped = await wait(5) { (currentImage(v)?.width ?? 0) == 12000 }
+        values["fullResolutionAfter"] = now - t0
+        check("E4 at 100% the full-resolution decode is swapped in (12000 wide)", swapped && currentImage(v)?.height == 8000,
+              currentImage(v).map { "\($0.width)x\($0.height)" })
+        values["memoryWithFullResolution"] = "resident \(memory().resident / 1e6) MB, peak \(memory().peak / 1e6) MB"
+        check("E4 while it is wanted the cache keeps half its budget", v.loader.cache.totalCostLimit == v.loader.costLimit / 2,
+              v.loader.cache.totalCostLimit)
+        check("E4 the swap keeps the layout: 100%, centered", c.scale == 1 && abs(c.imageLayer.frame.midX - c.bounds.midX) < 0.5
+              && c.imageLayer.frame.width == 12000, NSStringFromRect(c.imageLayer.frame))
+        for k in 0..<12 { // trackpad pans across it, then further zoom in and back
+            w.sendEvent(scroll(k < 6 ? 120 : -120, 40, precise: true, phase: 2, inverted: true, w))
+            await sleep(0.03)
+        }
+        press(24, "=", [], w)
+        await sleep(0.3)
+        press(18, "1", [], w)
+        await sleep(0.3)
+        let beat = stopHeartbeat()
+        values["heartbeat"] = beat
+        check("E4 main thread never blocked > 50 ms (zoom, full decode, swap, pans)", beat.max < 0.05, beat)
+        check("E4 still the full-resolution pixels after panning and zooming", currentImage(v)?.width == 12000, currentImage(v)?.width)
+        // Crisp: at 100% the full decode's glyph edges are far sharper than the screen-size decode stretched there.
+        let region = NSRect(x: c.bounds.midX - 500, y: c.bounds.midY - 300, width: 1000, height: 600)
+        guard let full = v.shown, let screenDecode, let crisp = screenshot("large-100") else { return }
+        c.setPixels(screenDecode)
+        await sleep(0.3)
+        let soft = screenshot("large-100-screen-decode")
+        c.setPixels(full)
+        let sharp = sharpness(crisp, region, w), blurred = soft.map { sharpness($0, region, w) } ?? -1
+        values["edgeStep"] = "full \(sharp), screen-size decode \(blurred)"
+        check("E4 crisp: full-resolution edge steps > 2 × the screen-size decode's", blurred > 0 && sharp > 2 * blurred, values["edgeStep"])
+        press(29, "0", [], w)
+        check("E4 back to fit keeps the full-resolution pixels", c.isFit && currentImage(v)?.width == 12000, currentImage(v)?.width)
+        press(123, left, arrow, w)
+        guard await displayed(v) else { return check("previous image displayed", false, nil) }
+        press(124, right, arrow, w)
+        check("E4 the full decode is never cached: back on the image, the screen-size decode", currentImage(v)?.width == image.width
+              && v.loader.cache.object(forKey: v.currentURL! as NSURL)?.longEdge == longEdge, currentImage(v)?.width)
+        check("E4 moving on gives the cache its whole budget back", v.loader.cache.totalCostLimit == v.loader.costLimit,
+              v.loader.cache.totalCostLimit)
+    }
+
+    /// The largest step in brightness between horizontal neighbors in a window-coordinates region of a capture.
+    private static func sharpness(_ shot: CGImage, _ region: NSRect, _ window: NSWindow) -> Double {
+        let k = CGFloat(shot.width) / window.frame.width
+        let rect = CGRect(x: region.minX * k, y: (window.frame.height - region.maxY) * k, width: region.width * k, height: region.height * k)
+        guard let crop = shot.cropping(to: rect.integral) else { return -1 }
+        let w = crop.width, h = crop.height
+        var buffer = [UInt8](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                .draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        var best = 0
+        for y in 0..<h {
+            var previous = -1
+            for x in 0..<w {
+                let i = (y * w + x) * 4
+                let luma = (Int(buffer[i]) * 3 + Int(buffer[i + 1]) * 6 + Int(buffer[i + 2])) / 10
+                if previous >= 0 { best = max(best, abs(luma - previous)) }
+                previous = luma
+            }
+        }
+        return Double(best) / 255
     }
 
     /// A3 blur style + A10 blur screenshot. Launched with `-backdropStyle blur`.
@@ -297,7 +458,7 @@ enum SelfTest {
         expectQuit(v, fade: fade)
         // Real path first: NSApp routes key equivalents to the main menu, plain keys to the key window.
         values["path"] = "NSApp.sendEvent"
-        NSApp.sendEvent(event)
+        sendKey(event)
         await sleep(0.6)
         // Accessory apps that aren't active have no key window: deliver to the viewer window directly.
         values["path"] = "window.sendEvent"
@@ -314,8 +475,12 @@ enum SelfTest {
         let key = await wait(2) { v.window.isKeyWindow }
         values["firstResponder"] = v.window.firstResponder.map { "\(type(of: $0))" } ?? "nil"
         check("window becomes key when the app is active", key, "\(v.window.isKeyWindow) active \(NSApp.isActive)")
+        // A key from the event queue, as the owner's real keys arrive: the real-input filter drops it.
+        NSApp.postEvent(self.key(53, "\u{1b}", [], v.window), atStart: false)
+        await sleep(0.3)
+        check("a queued (real-input) Esc is filtered out", v.window.isVisible && v.window.alphaValue == 1, Double(v.window.alphaValue))
         expectQuit(v, fade: true)
-        NSApp.sendEvent(self.key(53, "\u{1b}", [], v.window))
+        sendKey(self.key(53, "\u{1b}", [], v.window))
         await sleep(2)
         check("Esc via key window quits", false, "still running")
     }
@@ -392,7 +557,7 @@ enum SelfTest {
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["-g", "-a", Bundle.main.bundlePath, env["LIGHTBOX_ODOC_FILE"] ?? ""]
+        p.arguments = ["-g", "-a", Bundle.main.bundlePath, env["PICASSO_ODOC_FILE"] ?? ""]
         try? p.run()
         guard await wait(6, { viewer?.window.isVisible == true && viewer?.window.alphaValue == 1 }), let v = viewer else {
             return check("viewer shown after odoc", false, openCalls)
@@ -589,6 +754,7 @@ enum SelfTest {
         check("B2 fake.jpg shows the can't-open message", message && v.message.stringValue.contains("fake.jpg")
               && v.canvas.imageLayer.contents == nil, v.message.stringValue)
         screenshot("index-fake")
+        uncache(v.images[fake + 1])
         press(124, right, arrow, w)
         check("B2 → past fake.jpg moves on", v.index == fake + 1, v.index)
         check("B2 the can't-open message hides on moving on, before the next decode lands", v.message.isHidden && shownURL != v.currentURL,
@@ -719,6 +885,25 @@ enum SelfTest {
         for _ in 0..<6 { wheel(-10, 0, precise: true) }
         expect("smooth mouse: 60 pt right → next", 3)
 
+        // D8b: a gesture's unfinished swipe is not a head start for a smooth-mouse run.
+        swipe(5, 0, inverted: false, v); expect("short swipe right (30 pt): no navigation", 3)
+        for _ in 0..<3 { wheel(-10, 0, precise: true) }
+        expect("D8b then 30 pt smooth-mouse right: no navigation (with the swipe's 30 pt it would)", 3)
+        for _ in 0..<3 { wheel(-10, 0, precise: true) }
+        expect("smooth mouse: 30 pt more → next", 4)
+        // D8b: a gesture begun with ⌘ starts over too. After a swipe that navigated: ⌘ at the start, released mid-way.
+        swipe(-20, 0, inverted: true, v); expect("swipe left → next", 5)
+        func gesture(_ dx: Int32, phase: Int64, command: Bool) {
+            w.sendEvent(scroll(dx, 0, precise: true, phase: phase, inverted: true, command: command, w))
+            sentScrolls += 1
+        }
+        gesture(0, phase: 128, command: true) // mayBegin
+        gesture(-20, phase: 1, command: true)
+        gesture(-20, phase: 2, command: true)
+        for _ in 0..<5 { gesture(-20, phase: 2, command: false) }
+        gesture(0, phase: 4, command: false)
+        expect("D8b a gesture begun with ⌘, ⌘ released mid-way, 100 pt left → next", 6)
+
         values["scrollEvents"] = "\(scrollEvents) received, \(sentScrolls) sent"
         check("every synthesized scroll event reached scrollWheel (momentum included)",
               scrollEvents == sentScrolls, values["scrollEvents"])
@@ -732,10 +917,14 @@ enum SelfTest {
         press(119, end, .function, w)
         check("End: 11-primary.heic displayed, 10-huge.jpg just before it", await displayed(v) && huge == v.index - 1,
               "\(v.index) \(huge)")
+        await sleep(0.4) // the next press is a single step, not flying
+        uncache(v.images[huge]) // else its preload has it ready
         staleShown = []
-        var callbacks = decodeCallbacks, shows = shownCount
-        // 5 × ←: the first starts the slow 12000×8000 decode, the other 4 land while it runs.
+        var callbacks = decodeCallbacks, shows = shownCount, dropped = staleDropped
+        // 5 × ←: the first starts the slow 12000×8000 decode, the other 4 fly on while it runs.
         press(123, left, arrow, w)
+        check("← to 10-huge.jpg: its decode is in flight", v.currentURL == v.images[huge] && v.displayedURL != v.currentURL,
+              v.displayedURL?.lastPathComponent)
         await sleep(0.02)
         for _ in 0..<4 { press(123, left, arrow, w) }
         check("5 ← presses reach index 5", v.index == 5, v.index)
@@ -745,9 +934,9 @@ enum SelfTest {
               "\(shownURL?.lastPathComponent ?? "nil") \(v.canvas.imageSize)")
         values["burstDecodes"] = decodeCallbacks - callbacks
         values["burstShows"] = shownCount - shows
-        check("burst: the huge decode arrived stale and was dropped (decodes > shows)",
-              decodeCallbacks - callbacks > shownCount - shows, "\(decodeCallbacks - callbacks) decodes, \(shownCount - shows) shown")
-        // Spaced presses: some decodes finish between presses, some (the huge one) after the next press.
+        check("burst: the huge decode arrived stale and was dropped", staleDropped > dropped && shownURL != v.images[huge],
+              "\(staleDropped - dropped) dropped")
+        // Spaced presses, flying: cached images show at once, the others' fast thumbnails; nothing late wins.
         callbacks = decodeCallbacks; shows = shownCount
         for _ in 0..<5 { press(124, right, arrow, w); await sleep(0.004) }
         check("spaced: at the last index again", v.index == 10, v.index)
@@ -1002,7 +1191,7 @@ enum SelfTest {
     private static func rotateScenario() async {
         guard let v = await ready() else { return }
         let c = v.canvas, w = v.window
-        if env["LIGHTBOX_RELAUNCHED"] == "1" {
+        if env["PICASSO_RELAUNCHED"] == "1" {
             check("relaunched: upright, landscape", c.rotation == 0 && c.imageLayer.frame.width > c.imageLayer.frame.height,
                   "\(c.rotation) \(NSStringFromRect(c.imageLayer.frame))")
             return
@@ -1051,6 +1240,8 @@ enum SelfTest {
         check("back: its rotation is remembered (90, portrait)", c.rotation == 90 && c.imageLayer.frame.height > c.imageLayer.frame.width,
               "\(c.rotation) \(NSStringFromRect(c.imageLayer.frame))")
         // Shift+R while the next decode is in flight turns the image being opened, not the one still on screen.
+        await sleep(0.3) // landed (its preloads done), so → is a single step: flying would show the strip's thumbnail at once
+        uncache(v.images[v.index + 1])
         press(124, right, arrow, w)
         let inFlight = v.displayedURL != v.currentURL
         press(15, "R", .shift, w)
@@ -1070,7 +1261,7 @@ enum SelfTest {
         let child = Process()
         child.executableURL = Bundle.main.executableURL
         child.arguments = [CommandLine.arguments[1]]
-        child.environment = env.merging(["LIGHTBOX_RELAUNCHED": "1", "LIGHTBOX_SELFTEST_OUT": childOut.path]) { $1 }
+        child.environment = env.merging(["PICASSO_RELAUNCHED": "1", "PICASSO_SELFTEST_OUT": childOut.path]) { $1 }
         try? child.run()
         let exited = await wait(15) { !child.isRunning }
         if !exited { child.terminate() } // never leave its full-screen window over the display
@@ -1138,7 +1329,7 @@ enum SelfTest {
         check("previous → 0", v.index == 0, v.index)
         check("first image displayed", await displayed(v), shownURL?.lastPathComponent)
 
-        check("fit button at fit offers actual size", o.fit.toolTip == "Actual Size", o.fit.toolTip)
+        check("fit button at fit offers actual size, enabled", o.fit.toolTip == "Actual Size" && o.fit.isEnabled, o.fit.toolTip)
         let fitIcon = o.fit.image
         await tap(o.fit)
         check("fit button → 100%", c.scale == 1, c.scale)
@@ -1199,6 +1390,21 @@ enum SelfTest {
         check("back at the first image the left arrow dims in place", o.leftCircle.alphaValue == 1 && !o.leftArrow.isEnabled
               && o.leftArrow.alphaValue < 0.5, "\(o.leftCircle.alphaValue) \(o.leftArrow.alphaValue)")
         check("no control click closed the viewer", w.isVisible && w.alphaValue == 1, nil)
+
+        // D8a: for a 300×200 image fit is 100%, so the toggle has nothing to switch to until zoomed in.
+        guard await open("03-small.png", size: CGSize(width: 300, height: 200)) else { return }
+        let small = c.imageLayer.frame
+        check("D8a 300x200 at fit == 100%: the fit button is disabled", c.fitScale == 1 && c.isFit && !o.fit.isEnabled,
+              "\(c.fitScale) \(o.fit.isEnabled)")
+        await tap(o.fit)
+        doubleClick(NSPoint(x: small.minX + 30, y: small.maxY - 20), w)
+        await sleep(0.3)
+        check("D8a clicking it, and double-clicking the image off-center, change nothing", c.scale == 1 && c.imageLayer.frame == small
+              && w.alphaValue == 1, "\(c.scale) \(NSStringFromRect(c.imageLayer.frame))")
+        press(24, "=", [], w)
+        check("zoomed in: enabled, offers fit", o.fit.isEnabled && o.fit.toolTip == "Fit to Screen", o.fit.toolTip)
+        await tap(o.fit)
+        check("its click fits again, and it is disabled again", c.isFit && c.scale == 1 && !o.fit.isEnabled, c.scale)
     }
 
     /// C7: launched with the nav folder (9 images). The slideshow advances every interval, a manual step restarts the
@@ -1218,6 +1424,10 @@ enum SelfTest {
         check("advances after one interval (0 → 1)", v.index == 1 && first.map { abs($0 - interval) < 0.15 } == true, first)
         let second = await nextChange()
         check("and again (1 → 2)", v.index == 2 && second.map { abs($0 - interval) < 0.15 } == true, second)
+        let held = assertions()
+        values["assertionsWhilePlaying"] = held
+        check("E7 playing keeps the display awake (activity held, PreventUserIdleDisplaySleep asserted)",
+              v.slideshowActivity != nil && held.contains("PreventUserIdleDisplaySleep"), held)
         await sleep(interval / 2)
         press(124, right, arrow, w)
         let afterManual = await nextChange()
@@ -1232,8 +1442,16 @@ enum SelfTest {
         let i = v.index
         await sleep(interval * 3)
         check("pause stops it", v.slideshow == nil && v.index == i, v.index)
+        let released = assertions()
+        check("E7 paused: the activity is released", v.slideshowActivity == nil && !released.contains("PreventUserIdleDisplaySleep"), released)
         v.toggleSlideshow()
+        check("playing again holds it again", v.slideshowActivity != nil, nil)
         expectQuit(v, fade: true)
+        let quit = onTerminate
+        onTerminate = {
+            quit?()
+            check("E7 closing releases it", v.slideshow == nil && v.slideshowActivity == nil, nil)
+        }
         press(53, "\u{1b}", [], w)
         await sleep(2)
         check("Esc closes during a slideshow", false, "still running")
@@ -1244,22 +1462,25 @@ enum SelfTest {
     private static func autoHideScenario() async {
         guard let v = await ready() else { return }
         let o = v.controls, w = v.window, b = v.canvas.bounds
-        let elements = ["pill": o.pill, "bar": o.bar, "leftCircle": o.leftCircle, "rightCircle": o.rightCircle]
+        let elements = ["pill": o.pill, "bar": o.bar, "strip": o.stripSurface, "leftCircle": o.leftCircle, "rightCircle": o.rightCircle]
         let mid = NSPoint(x: b.midX, y: b.midY)
-        check("shown at open (pill and bar)", o.isShown && o.pill.alphaValue == 1 && o.bar.alphaValue == 1, nil)
+        check("shown at open (pill, bar and strip)", o.isShown && o.pill.alphaValue == 1 && o.bar.alphaValue == 1
+              && o.stripSurface.alphaValue == 1, nil)
         let hidden = await wait(5) { o.bar.alphaValue == 0 }
         let idle = now - presentTime
         values["hiddenAfterOpen"] = idle
         check("hidden 3 s after opening without mouse movement", hidden && idle > 2.95 && idle < 3.5, idle)
         check("all controls alpha 0", elements.values.allSatisfy { $0.alphaValue == 0 }, elements.mapValues(\.alphaValue))
         check("the cursor hides with them", cursorHides == 1, cursorHides)
-        check("hidden controls take no clicks", o.hitTest(center(o.bar)) == nil && o.hitTest(center(o.pill)) == nil, nil)
+        check("hidden controls take no clicks", o.hitTest(center(o.bar)) == nil && o.hitTest(center(o.pill)) == nil
+              && o.hitTest(center(o.stripSurface)) == nil, nil)
         // move() below calls the handler directly; real motion reaches it through this area.
         check("the overlay owns an always-active mouseMoved tracking area", o.trackingAreas.contains {
             $0.owner === o && $0.options.isSuperset(of: [.mouseMoved, .activeAlways, .inVisibleRect]) }, o.trackingAreas.map(\.options.rawValue))
 
         move(mid, v)
-        check("mouse move shows them again (alpha 1)", o.isShown && o.bar.alphaValue == 1 && o.pill.alphaValue == 1, nil)
+        check("mouse move shows them again (alpha 1)", o.isShown && o.bar.alphaValue == 1 && o.pill.alphaValue == 1
+              && o.stripSurface.alphaValue == 1, nil)
         check("visible controls take clicks", o.hitTest(center(o.next))?.isDescendant(of: o.bar) == true, nil)
         check("away from the controls the overlay takes no clicks", o.hitTest(mid) == nil, nil)
         move(NSPoint(x: b.width * 0.05, y: b.midY), v)
@@ -1329,6 +1550,577 @@ enum SelfTest {
         check("another folder: its name and count", v.controls.label.stringValue == "02-portrait.jpg  2 / 11", v.controls.label.stringValue)
     }
 
+    // MARK: Step 4: thumbnail strip
+
+    /// D1–D3, D6: launched with the 1200-image folder. The strip has an item per image, but only images in or near view
+    /// get cells and decodes, also while it scrolls; the current image stays centered (animated for a step, instantly
+    /// when flying or jumping); clicking a thumbnail goes there; the wheel scrolls the strip only while over it.
+    private static func stripScenario() async {
+        guard let v = await ready() else { return }
+        let s = v.controls.strip, o = v.controls, w = v.window, pitch = ThumbnailStrip.pitch
+        let perView = Int(ceil(s.bounds.width / pitch))
+        values["stripFrame"] = NSStringFromRect(o.stripSurface.frame)
+        values["cellsPerView"] = perView
+        check("showThumbnails on, strip not hidden", Settings.showThumbnails && !o.stripSurface.isHidden, nil)
+        check("D1 an item per image (1200), in viewer order", s.images.count == 1200 && s.images == v.images, s.images.count)
+        let sf = o.stripSurface.frame
+        check("as wide as 60% of the screen (the thumbnails would need more)", abs(sf.width - o.bounds.width * 0.6) < 0.5
+              && s.frame.size == o.stripSurface.bounds.size, NSStringFromRect(sf))
+        check("centered, 10 pt above the bar", abs(sf.midX - o.bounds.midX) < 0.5 && abs(sf.minY - o.bar.frame.maxY - 10) < 0.5,
+              "\(NSStringFromRect(sf)) bar \(NSStringFromRect(o.bar.frame))")
+        // Cells and decodes stay O(visible): sampled after every step below.
+        var maxCells = 0, maxPending = 0, strays: [String] = []
+        func sample(_ stage: String) {
+            let layers = s.content.sublayers?.count ?? 0
+            maxCells = max(maxCells, layers)
+            maxPending = max(maxPending, s.pending.count)
+            let inView = Set(s.cells.keys.map { s.images[$0] })
+            // A decode for a file out of view may still be running (it only fills the cache), but never waiting.
+            let queuedOut = s.pending.contains { !inView.contains($0.key) && !$0.value.isExecuting && !$0.value.isFinished }
+            if layers != s.cells.count || queuedOut { strays.append(stage) }
+        }
+        let loaded = { s.cells.values.allSatisfy { $0.contents != nil } }
+        sample("open")
+        values["cellsAtOpen"] = s.cells.count
+        check("D1 at open: cells only in or near view (< 80)", s.cells.count < 80 && s.cells.count <= perView + 5,
+              "\(s.cells.count) cells, \(perView) per view")
+        check("D1 at open: one decode request per cell", thumbRequests == s.cells.count, "\(thumbRequests) requests")
+        check("thumbnails in view load", await wait(5, loaded), s.cells.values.filter { $0.contents == nil }.count)
+        checkOwnThumbs(s, "at open")
+        check("D3 at index 0 the strip is at its start", v.index == 0 && s.offset == 0 && s.cellFrame(0).minX == ThumbnailStrip.inset,
+              s.offset)
+        check("the current cell is highlighted (white border, larger)", s.cells[0].map { $0.borderWidth == 2
+              && $0.affineTransform().a == 1.1 } == true && s.cells[1]?.borderWidth == 0, nil)
+
+        /// A thumbnail's center in window coordinates.
+        func thumb(_ k: Int) -> NSPoint { s.convert(NSPoint(x: s.cellFrame(k).midX, y: s.cellFrame(k).midY), to: nil) }
+        move(thumb(5), v)
+        check("thumbnail 5 is what the pointer hits", o.hitTest(thumb(5)) === s, o.hitTest(thumb(5)).map { "\(type(of: $0))" })
+        click(thumb(5), w)
+        check("D2 clicking thumbnail 5 shows image 5", v.index == 5 && v.currentURL == v.images[5], v.index)
+        check("image 5 displayed", await displayed(v), shownURL?.lastPathComponent)
+        click(s.convert(NSPoint(x: s.cellFrame(2).maxX + ThumbnailStrip.gap / 2, y: s.cellFrame(2).midY), to: nil), w)
+        click(s.convert(NSPoint(x: 3, y: s.bounds.midY), to: nil), w) // the end padding
+        await sleep(0.3)
+        check("clicks between thumbnails: no navigation, no close", v.index == 5 && w.isVisible && w.alphaValue == 1, v.index)
+
+        let onStrip = center(s)
+        // Hover: the thumbnail under the resting pointer is lit, also after the strip scrolls under it.
+        move(onStrip, v, into: s)
+        let under = { s.cells.keys.filter { s.cellFrame($0).contains(s.convert(onStrip, from: nil)) } }
+        let lit = { s.cells.filter { $0.value.opacity == 1 }.keys.filter { $0 != s.current }.sorted() }
+        func hoverOK() -> Bool { under().count == 1 && lit() == under().filter { $0 != s.current } }
+        let hoveredBefore = under()
+        check("the thumbnail under the pointer is lit", hoverOK(), "lit \(lit()) under \(under())")
+        w.sendEvent(scroll(0, -1, at: onStrip, w))
+        check("a wheel notch over the strip scrolls it one thumbnail, no navigation", s.offset == pitch && v.index == 5,
+              "\(s.offset) \(v.index)")
+        check("the highlight moves to the thumbnail now under the pointer", hoverOK() && under() != hoveredBefore,
+              "lit \(lit()) under \(under())")
+        w.sendEvent(scroll(0, 1, at: onStrip, w))
+        check("and back", s.offset == 0 && v.index == 5 && hoverOK() && under() == hoveredBefore, "\(s.offset) lit \(lit())")
+        w.sendEvent(scroll(0, -1, at: NSPoint(x: o.bounds.midX, y: o.bounds.midY), w))
+        check("a wheel notch over the image still navigates", v.index == 6, v.index)
+
+        // A two-finger scroll over the strip at a trackpad's ~120 events/s, 400 pt each.
+        let before = thumbRequests
+        w.sendEvent(scroll(0, 0, precise: true, phase: 1, at: onStrip, w))
+        for k in 0..<40 {
+            w.sendEvent(scroll(-400, 0, precise: true, phase: 2, at: onStrip, w))
+            sample("scroll \(k)")
+            await sleep(0.008)
+        }
+        w.sendEvent(scroll(0, 0, precise: true, phase: 4, at: onStrip, w))
+        let passed = Int(16000 / pitch)
+        values["requestsWhileScrolling"] = thumbRequests - before
+        values["maxCells"] = maxCells
+        values["maxPending"] = maxPending
+        check("two-finger scroll over the strip moves it 16000 pt, no navigation", s.offset == 16000 && v.index == 6,
+              "\(s.offset) \(v.index)")
+        check("D1 scrolling past \(passed) thumbnails: never 80 cells", maxCells < 80, maxCells)
+        check("D1 decode requests only for thumbnails that came into view (<= \(passed) + \(perView + 5))",
+              thumbRequests - before <= passed + perView + 5, thumbRequests - before)
+        check("D1 pending decodes stay O(visible)", maxPending <= maxCells + 8, "\(maxPending) pending, \(maxCells) cells")
+        check("D1 no queued decode for a file out of view, no stray cell", strays.isEmpty, strays)
+        check("thumbnails load where it was scrolled to", await wait(5, loaded), s.cells.values.filter { $0.contents == nil }.count)
+        checkOwnThumbs(s, "after scrolling")
+
+        // In-flight de-duplication: into a part not decoded yet, away and straight back, all in one main-thread turn (so no
+        // result arrives in between). Decodes already running are not asked for again; only the cancelled ones are.
+        w.sendEvent(scroll(-3000, 0, precise: true, at: onStrip, w))
+        let fresh = Set(s.cells.keys.map { s.images[$0] })
+        w.sendEvent(scroll(-5000, 0, precise: true, at: onStrip, w))
+        let running = s.pending.keys.filter(fresh.contains).count
+        let r = thumbRequests
+        w.sendEvent(scroll(5000, 0, precise: true, at: onStrip, w))
+        values["dedup"] = "\(fresh.count) cells, \(running) still decoding, \(thumbRequests - r) asked again"
+        check("D1 back in view: only the cancelled decodes are asked for again", Set(s.cells.keys.map { s.images[$0] }) == fresh
+              && running > 0 && thumbRequests - r == fresh.count - running, values["dedup"])
+        sample("dedup")
+        check("those thumbnails load", await wait(5, loaded), nil)
+        checkOwnThumbs(s, "after away and back")
+
+        v.go(to: 600)
+        check("D3 a jump to 600: centered within half a cell", abs(s.cellFrame(600).midX - s.bounds.midX) <= pitch / 2,
+              s.cellFrame(600).midX - s.bounds.midX)
+        check("a jump scrolls instantly", s.content.animationKeys() == nil, s.content.animationKeys())
+        await sleep(0.35)
+        check("D3 after the jump the cells are drawn where cellFrame says", drawnOff(s).isEmpty, drawnOff(s))
+        press(124, right, arrow, w)
+        let step = s.content.animation(forKey: "bounds")
+        check("a single step: centered, animated over 0.2 s", v.index == 601 && step?.duration == 0.2
+              && abs(s.cellFrame(601).midX - s.bounds.midX) <= pitch / 2, "\(v.index) \(String(describing: s.content.animationKeys()))")
+        // While the step still slides, a click near the right edge of where 603 is drawn: by the target position
+        // that is 604 (or the gap), so this needs hit-testing by the drawn position.
+        move(center(o.bar), v)
+        await sleep(0.03)
+        let lag = s.offset - (s.content.presentation() ?? s.content).bounds.origin.x
+        let sliding = !drawnOff(s).isEmpty
+        click(s.convert(NSPoint(x: s.cellFrame(603).maxX + lag - 5, y: s.cellFrame(603).midY), to: nil), w)
+        values["lagAtClick"] = lag
+        check("D2 a click while a step slides picks the thumbnail drawn there", lag > 6 && sliding && v.index == 603,
+              "index \(v.index), drawn \(lag) pt behind the target")
+        // Holding →: key repeat at 30 Hz.
+        var animated = 0, offCenter = 0
+        for _ in 0..<30 {
+            press(124, right, arrow, w, repeat: true)
+            if s.content.animationKeys() != nil { animated += 1 }
+            if abs(s.cellFrame(v.index).midX - s.bounds.midX) > pitch / 2 { offCenter += 1 }
+            sample("flying")
+            await sleep(0.033)
+        }
+        check("held → reaches 633", v.index == 633, v.index)
+        check("D3 flying: the current image centered at every step", offCenter == 0, offCenter)
+        check("flying scrolls instantly, never animated", animated == 0, animated)
+        check("D1 flying: never 80 cells, no queued decode out of view", maxCells < 80 && strays.isEmpty, "\(maxCells) \(strays)")
+        check("633 displayed", await displayed(v), shownURL?.lastPathComponent)
+        check("D3 after flying the cells are drawn where cellFrame says", drawnOff(s).isEmpty, drawnOff(s))
+        move(center(o.bar), v)
+        check("thumbnails around 633 load", await wait(5, loaded), nil)
+        checkOwnThumbs(s, "at 633")
+        await sleep(0.4)
+        screenshot("strip-1200")
+
+        press(119, end, .function, w)
+        check("End: the strip at its end", v.index == 1199 && abs(s.cellFrame(1199).maxX - (s.bounds.width - ThumbnailStrip.inset)) < 0.01,
+              s.cellFrame(1199).maxX)
+        press(115, home, .function, w)
+        check("D3 Home: back at the start", v.index == 0 && s.offset == 0, s.offset)
+        sample("end and home")
+        o.hide()
+        w.sendEvent(scroll(0, -1, at: onStrip, w))
+        check("controls hidden: a wheel notch where the strip was navigates", v.index == 1, v.index)
+        check("D1 overall: never 80 cells, no queued decode out of view", maxCells < 80 && strays.isEmpty, "\(maxCells) \(strays)")
+    }
+
+    /// D4–D6: launched with 01-landscape.jpg (the 11 mixed-format fixtures, all in view). Each thumbnail decodes once,
+    /// off the main thread (ImageLoader.preview's dispatchPrecondition stops the app otherwise), small and upright;
+    /// reopening the folder serves them all from the cache. The showThumbnails default hides and shows the strip, live.
+    private static func thumbsScenario() async {
+        defer { UserDefaults.standard.removeObject(forKey: "showThumbnails") }
+        guard let v = await ready() else { return }
+        let s = v.controls.strip, o = v.controls, w = v.window
+        let start = now
+        let loaded = await wait(5) { s.cells.count == 11 && s.cells.values.allSatisfy { $0.contents != nil } }
+        values["thumbnailsLoadedAfterReady"] = now - start
+        check("all 11 in view (the strip as wide as its thumbnails), each loaded", loaded && s.images.count == 11
+              && s.bounds.width == s.intrinsicContentSize.width && s.offset == 0, "\(s.cells.count) \(s.bounds.width)")
+        await sleep(0.2)
+        check("D4 one decode per thumbnail (11 requests, 11 delivered)", thumbRequests == 11 && thumbLoads == 11 && thumbHits == 0,
+              "\(thumbRequests) \(thumbLoads) \(thumbHits)")
+        let decodeMs = (lastThumbLoad - firstThumbRequest) * 1000
+        values["decodeAll11Ms"] = decodeMs
+        let maxPixel = Int(ThumbnailStrip.cellSize.width * w.backingScaleFactor * 1.2)
+        for (i, url) in s.images.enumerated() {
+            let name = url.lastPathComponent, size = orientedSize(url)
+            guard let thumb = s.cache.object(forKey: url as NSURL), let cell = s.cells[i] else { check("\(name): cached", false, nil); continue }
+            let t = thumb.image
+            check("\(name): cached with its image's full size", thumb.pixelSize == size, thumb.pixelSize)
+            check("\(name): thumbnail \(t.width)x\(t.height), \(maxPixel) px long edge, the image's aspect",
+                  max(t.width, t.height) == maxPixel && abs(Double(t.width) / Double(t.height) - size.width / size.height) < 0.02, nil)
+            checkBands(t, "\(name) thumbnail")
+            let b = cell.bounds
+            check("\(name): cell aspect-fit in its 80x64 slot", b.width <= 80 && b.height <= 64 && (b.width == 80 || b.height == 64)
+                  && abs(b.width / b.height - size.width / size.height) < 0.05, NSStringFromRect(b))
+        }
+        checkOwnThumbs(s, "loaded")
+        move(center(o.bar), v)
+        await sleep(0.4)
+        screenshot("strip-mixed")
+
+        // A second request for each: reopen the folder.
+        let requests = thumbRequests, loads = thumbLoads, hits = thumbHits, t0 = now
+        app?.application(NSApp, open: [fixtures.appendingPathComponent("03-small.png")])
+        let reopenMs = (now - t0) * 1000
+        values["reopenMs"] = reopenMs
+        check("D4 reopening: all 11 thumbnails from the cache at once, no decode", s.images.count == 11 && thumbHits - hits == 11
+              && thumbRequests == requests && s.cells.count == 11 && s.cells.values.allSatisfy { $0.contents != nil },
+              "\(thumbHits - hits) hits, \(thumbRequests - requests) requests")
+        checkOwnThumbs(s, "reopened")
+        check("D4 measured: the cached reopen (folder listing included) beats decoding them", reopenMs < decodeMs,
+              "reopen \(reopenMs) ms vs decode \(decodeMs) ms")
+        check("the opened file is highlighted", v.index == 2 && s.current == 2 && s.cells[2]?.borderWidth == 2 && s.cells[0]?.borderWidth == 0,
+              v.index)
+        await sleep(0.3)
+        check("and no decode arrives later", thumbLoads == loads, thumbLoads - loads)
+
+        // D5: the default, live.
+        move(center(o.bar), v)
+        UserDefaults.standard.set(false, forKey: "showThumbnails")
+        let stripPoint = center(o.stripSurface)
+        let hid = await wait(0.2) { o.stripSurface.isHidden }
+        check("D5 showThumbnails = false hides the strip (next turn)", hid && o.hitTest(stripPoint) == nil, nil)
+        await sleep(0.4)
+        check("the rest of the controls stay", o.isShown && o.bar.alphaValue == 1 && o.stripSurface.alphaValue == 0, nil)
+        w.sendEvent(scroll(0, -1, at: stripPoint, w))
+        check("a wheel notch where the strip was navigates", v.index == 3, v.index)
+        let r = thumbRequests
+        app?.application(NSApp, open: [nav.appendingPathComponent("img2.jpg")])
+        check("hidden: another folder still gets its cells and thumbnail decodes (they stand in while flying), out of sight",
+              s.images.count == 9 && s.cells.count == 9 && thumbRequests - r == 9 && o.stripSurface.isHidden
+              && o.hitTest(stripPoint) == nil, "\(s.cells.count) \(thumbRequests - r)")
+        move(center(o.bar), v)
+        UserDefaults.standard.set(true, forKey: "showThumbnails")
+        let shown = await wait(1) { !o.stripSurface.isHidden && o.stripSurface.alphaValue == 1 }
+        check("D5 showThumbnails = true shows it again, live, with the new folder's cells", shown && s.cells.count == 9
+              && s.current == v.index && o.hitTest(center(s)) === s, "\(s.cells.count) \(s.current) \(v.index)")
+        let settled = await wait(5) { s.pending.isEmpty }
+        let empty = s.cells.filter { $0.value.contents == nil }.map { s.images[$0.key].lastPathComponent }
+        check("its thumbnails load (the text file named fake.jpg keeps the placeholder)", settled && empty == ["fake.jpg"], empty)
+        checkOwnThumbs(s, "shown again")
+        let failedAsks = thumbRequests
+        app?.application(NSApp, open: [nav.appendingPathComponent("img1.jpg")])
+        check("reopening it decodes nothing: fake.jpg's failure is remembered, not retried", s.images.count == 9
+              && s.cells.count == 9 && thumbRequests == failedAsks, thumbRequests - failedAsks)
+
+        // From another process (`defaults write` in a terminal) too.
+        func defaults(_ args: String...) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+            p.arguments = [args[0], Bundle.main.bundleIdentifier!] + args.dropFirst()
+            try? p.run()
+            p.waitUntilExit()
+        }
+        defaults("write", "showThumbnails", "-bool", "false")
+        let hidOutside = await wait(3) { o.stripSurface.isHidden }
+        check("D5 `defaults write … showThumbnails -bool false` from outside hides it, live", hidOutside, nil)
+        defaults("delete", "showThumbnails")
+        let backOutside = await wait(3) { !o.stripSurface.isHidden }
+        check("D5 `defaults delete` from outside (back to the default, on) shows it again", backOutside, nil)
+    }
+
+    // MARK: Step 5: performance
+
+    /// E1–E3: launched with the 1200-photo folder. Holding → at 30 Hz from the first image to the last: the main thread
+    /// stays free, each key is cheap, something of the current image is on screen within a step, and the last image is
+    /// sharp soon after. Then preloading where the user stops (at both ends and in the middle), and memory.
+    private static func flyScenario() async {
+        guard let v = await ready() else { return }
+        let w = v.window, n = v.images.count, loader = v.loader
+        check("1200 images", n == 1200, n)
+        func cached(_ range: ClosedRange<Int>) -> [Int] { range.filter { loader.cache.object(forKey: v.images[$0] as NSURL) == nil } }
+        await sleep(1)
+        startHeartbeat()
+        await sleep(1)
+        values["heartbeatIdle"] = stopHeartbeat()
+        // E2 at the start: the first image and the two after it.
+        check("E2 at the first image: 0...2 cached", cached(0...2).isEmpty, cached(0...2))
+
+        let decodes = decodeCallbacks, shownPreviews = previews
+        startHeartbeat()
+        let flight = await fly(v)
+        let sharp = await wait(2) { shownURL == v.images[n - 1] && v.shown?.longEdge == 2400 }
+        let settle = now - flight.end
+        let beat = stopHeartbeat()
+        let mean = flight.handling.reduce(0, +) / Double(flight.handling.count)
+        values["flightSeconds"] = flight.end - flight.start
+        values["heartbeat"] = beat
+        values["keyDownMs"] = "mean \(mean * 1000), max \((flight.handling.max() ?? 0) * 1000)"
+        values["maxBehind"] = flight.maxBehind
+        values["shownAtOnce"] = flight.atOnce
+        values["previewsShown"] = previews - shownPreviews
+        values["decodesWhileFlying"] = decodeCallbacks - decodes
+        values["lastImageSharpAfter"] = settle
+        check("E1 held → reaches the last image", v.index == n - 1, v.index)
+        check("E1 1199 keys at 30 Hz (~40 s)", abs(flight.end - flight.start - Double(n - 2) / 30) < 1.5, flight.end - flight.start)
+        check("E1 heartbeat max gap < 50 ms", beat.max < 0.05, beat)
+        check("E1 heartbeat p95 < 20 ms", beat.p95 < 0.02, beat)
+        check("E1 keyDown handling mean < 3 ms", mean < 0.003, values["keyDownMs"])
+        check("E1 the image on screen is never more than 1 behind", flight.maxBehind <= 1, flight.maxBehind)
+        check("E1 flying decodes only where it stops (fast thumbnails meanwhile)", decodeCallbacks - decodes < 20
+              && previews - shownPreviews > n / 2, "\(decodeCallbacks - decodes) decodes, \(previews - shownPreviews) thumbnails")
+        check("E1 the last image's screen-size decode is shown within 1 s of the last key", sharp && settle < 1, settle)
+        screenshot("fly-end")
+
+        // E2: stopped, the in-range neighbors preload; the next step then comes straight from the cache.
+        await sleep(2)
+        check("E2 at the last image: 1197...1199 cached", cached(1197...1199).isEmpty, cached(1197...1199))
+        v.go(to: 600)
+        await sleep(2)
+        check("E2 at 600 after 2 s: 598...602 cached", cached(598...602).isEmpty, cached(598...602))
+        let callbacks = decodeCallbacks, t0 = now
+        press(124, right, arrow, w)
+        CATransaction.flush() // the frame commit included
+        let step = now - t0
+        values["cachedStepMs"] = step * 1000
+        check("E2 → shows 601 from the cache in < 16 ms, no decode wait", step < 0.016 && v.index == 601 && shownURL == v.images[601]
+              && v.shown === loader.cache.object(forKey: v.images[601] as NSURL) && decodeCallbacks == callbacks, step)
+        press(115, home, .function, w)
+        await sleep(2)
+        check("E2 Home, after 2 s: 0...2 cached", cached(0...2).isEmpty, cached(0...2))
+        // In-flight de-duplication: a preload of 900 and then landing on it, in one main-thread turn, decode it once.
+        let far = v.images[900]
+        loader.preload([far], maxPixelSize: 3840)
+        v.go(to: 900)
+        check("landing on 900 while its preload is pending: displayed", await displayed(v), shownURL?.lastPathComponent)
+        await sleep(0.5)
+        check("and decoded once", screenDecodes[far] == 1, screenDecodes[far])
+        // A decode cached for a smaller screen (as before moving to a bigger one) is not reused soft: it decodes again.
+        let small = v.images[910]
+        loader.preload([small], maxPixelSize: 1200)
+        await wait(5) { screenDecodes[small] == 1 }
+        v.go(to: 910)
+        let redecoded = await wait(5) { shownURL == small && v.shown?.longEdge == 2400 }
+        check("a decode cached for a smaller screen (1200 px) is decoded again for this one", redecoded && screenDecodes[small] == 2,
+              "\(v.shown?.longEdge ?? 0) px, \(screenDecodes[small] ?? 0) decodes")
+
+        // E3. phys_footprint leaves ImageIO's decoded images out (it read under 100 MB with 1 GB of them cached), so
+        // resident memory is bounded too, with the cache overfilled: 140 more decodes of 15 MB, twice its budget. (The
+        // lifetime peak is only reported: resident size counts decode buffers ImageIO keeps for reuse, ~470 MB of them
+        // with the cache emptied in a standalone probe, and none of the cache's own bitmaps, so it doesn't track the
+        // cache. The cache's budget is enforced by its cost: checked below, also at the moment full resolution is asked.)
+        let limit = Int(min(1 << 30, ProcessInfo.processInfo.physicalMemory / 8))
+        values["cacheLimitMB"] = loader.cache.totalCostLimit >> 20
+        check("E3 cache cost limit = min(1 GB, RAM / 8)", loader.cache.totalCostLimit == limit, loader.cache.totalCostLimit)
+        func cacheCost() -> Int { v.images.compactMap { loader.cache.object(forKey: $0 as NSURL)?.cost }.reduce(0, +) }
+        let flood = Array(v.images[100..<240])
+        loader.preload(flood, maxPixelSize: 3840)
+        let filled = await wait(30) { flood.allSatisfy { screenDecodes[$0] != nil } }
+        var memory = self.memory()
+        values["floodedCacheMB"] = cacheCost() >> 20
+        values["flooded"] = "resident \(memory.resident / 1e6) MB, phys_footprint \(memory.footprint / 1e6) MB"
+        check("E3 overfilled, the cache stays within its limit (and is full)", filled && cacheCost() <= limit && cacheCost() > limit * 8 / 10,
+              cacheCost() >> 20)
+        check("E3 resident memory with the cache full < 1.5 GB", memory.resident > 0 && memory.resident < 1.5e9, values["flooded"])
+        check("E3 phys_footprint < 1.5 GB", memory.footprint > 0 && memory.footprint < 1.5e9, values["flooded"])
+        // On top, a 12000×8000 full-resolution decode (384 MB): the cache gives up half its budget while it is wanted.
+        var full: Decoded?
+        loader.loadFullResolution(fixtures.appendingPathComponent("10-huge.jpg")) { full = $0 }
+        let trimmed = cacheCost()
+        check("E3 asking for full resolution trims the cache to half its limit at once, before the decode allocates",
+              trimmed <= limit / 2 && trimmed > limit * 4 / 10, trimmed >> 20)
+        let got = await wait(10) { full != nil }
+        memory = self.memory()
+        values["withFullResolution"] = "cache \(cacheCost() >> 20) MB, resident \(memory.resident / 1e6) MB, peak \(memory.peak / 1e6) MB"
+        check("E3 + a full-resolution decode held: cache within half its limit, resident < 1.5 GB", got && full?.image.width == 12000
+              && cacheCost() <= limit / 2 && memory.resident < 1.5e9, values["withFullResolution"])
+        full = nil
+        loader.moved(to: v.currentURL!)
+        check("moving on gives the cache its whole budget back", loader.cache.totalCostLimit == limit, loader.cache.totalCostLimit)
+    }
+
+    /// E1 over files with no embedded preview (fixtures/plain: 90 PNGs of 6000×4000, whose fast thumbnail means
+    /// downsampling the whole image, longer than a key repeat). Flying shows the strip's cached thumbnail of each image
+    /// at once, so the image on screen keeps up as with camera JPEGs. flypnghidden: the same with the strip turned off
+    /// in Settings (its thumbnails still decode, out of sight).
+    private static func flyPNGScenario() async {
+        guard let v = await ready() else { return }
+        let n = v.images.count, s = v.controls.strip, url = v.images[n - 1], hidden = scenario == "flypnghidden"
+        check("90 PNGs", n == 90, n)
+        check(hidden ? "the strip is turned off" : "the strip is on", v.controls.stripSurface.isHidden == hidden
+              && Settings.showThumbnails != hidden, v.controls.stripSurface.isHidden)
+        let previewMs = await Task.detached { () -> Double in
+            let t = ProcessInfo.processInfo.systemUptime
+            _ = ImageLoader.preview(url, maxPixelSize: 384)
+            return (ProcessInfo.processInfo.systemUptime - t) * 1000
+        }.value
+        values["fastThumbnailMs"] = previewMs
+        check("no embedded preview: a fast thumbnail takes longer than a key repeat (33 ms)", previewMs > 33, previewMs)
+        check("the strip's first thumbnails load", await wait(10) { s.pending.isEmpty && s.cache.object(forKey: v.images[1] as NSURL) != nil }, nil)
+        startHeartbeat()
+        let flight = await fly(v)
+        let screen = v.window.screen!, screenPixels = Int(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor)
+        let sharp = await wait(2) { shownURL == url && v.shown?.longEdge == min(screenPixels, 6000) }
+        let settle = now - flight.end, beat = stopHeartbeat()
+        let mean = flight.handling.reduce(0, +) / Double(flight.handling.count)
+        values["heartbeat"] = beat
+        values["keyDownMs"] = "mean \(mean * 1000), max \((flight.handling.max() ?? 0) * 1000)"
+        values["maxBehind"] = flight.maxBehind
+        values["shownAtOnce"] = "\(flight.atOnce) of \(n - 1)"
+        values["lastImageSharpAfter"] = settle
+        check("held → reaches the last image", v.index == n - 1, v.index)
+        check("the image on screen is never more than 1 behind", flight.maxBehind <= 1, flight.maxBehind)
+        check("most steps show the strip's thumbnail before the key returns", flight.atOnce >= (n - 1) * 9 / 10, values["shownAtOnce"])
+        check("heartbeat max gap < 50 ms, keyDown mean < 3 ms", beat.max < 0.05 && mean < 0.003, "\(beat) \(values["keyDownMs"] ?? "")")
+        check("the last image's screen-size decode is shown within 1 s of the last key", sharp && settle < 1, settle)
+        screenshot("\(scenario)-end")
+    }
+
+    /// Holds → at 30 Hz from the current image to the last, sampling at each key and heartbeat how far the image on screen
+    /// lags behind the index. Returns each keyDown's handling time, that lag's maximum, the keys whose image was on screen
+    /// when they returned, and when the flight started and ended.
+    private static func fly(_ v: ViewerController) async -> (handling: [Double], maxBehind: Int, atOnce: Int, start: Double, end: Double) {
+        let position = Dictionary(uniqueKeysWithValues: v.images.enumerated().map { ($1, $0) })
+        func behind() -> Int { v.index - (v.displayedURL.flatMap { position[$0] } ?? -1000) }
+        var handling: [Double] = [], maxBehind = 0, atOnce = 0
+        onBeat = { maxBehind = max(maxBehind, behind()) }
+        let first = v.index, start = now
+        var end = start
+        for k in first + 1..<v.images.count {
+            let due = start + Double(k - first - 1) / 30
+            if due > now { await sleep(due - now) }
+            maxBehind = max(maxBehind, behind())
+            let t0 = now
+            press(124, right, arrow, v.window, repeat: k > first + 1)
+            end = now
+            handling.append(end - t0)
+            if v.displayedURL == v.currentURL { atOnce += 1 }
+        }
+        onBeat = nil
+        return (handling, maxBehind, atOnce, start, end)
+    }
+
+    /// E5: launched with gif/anim.gif (frames red, green, blue, yellow for 0.1, 0.25, 0.5 and 0.01 → 0.1 s). It plays
+    /// on a loop with each frame's delay; a 1-frame GIF is still; 30 frames of 2000×1200 are shrunk under 256 MB; an
+    /// animation shrunk below the fast thumbnail shown while flying onto it still replaces that thumbnail.
+    private static func gifScenario() async {
+        guard let v = await ready() else { return }
+        let layer = v.canvas.imageLayer, w = v.window
+        v.controls.hide()
+        func playing() -> CAKeyframeAnimation? { layer.animation(forKey: "frames") as? CAKeyframeAnimation }
+        guard let a = playing() else { return check("E5 anim.gif: a keyframe animation on contents", false, layer.animationKeys()) }
+        let times = (a.keyTimes ?? []).map(\.doubleValue), expected = [0, 0.1, 0.35, 0.85, 0.95].map { $0 / 0.95 }
+        values["keyTimes"] = times
+        check("E5 4 frames, discrete, looping forever", a.keyPath == "contents" && a.values?.count == 4 && a.calculationMode == .discrete
+              && a.repeatCount == .infinity, "\(a.values?.count ?? 0) \(a.calculationMode.rawValue) \(a.repeatCount)")
+        check("E5 total 0.95 s; frames start at 0, 0.1, 0.35, 0.85 s (0.01 s plays as 0.1)", abs(a.duration - 0.95) < 1e-9
+              && times.count == 5 && zip(times, expected).allSatisfy { abs($0 - $1) < 1e-9 }, "\(a.duration) \(times)")
+        let colors = (a.values as? [CGImage] ?? []).map { classify(pixel($0, x: 0.1, yFromTop: 0.5)) }
+        check("E5 the frames are red, green, blue, yellow", colors == ["R", "G", "B", "Y"], colors)
+        // On screen, captures over a second or so catch more than one frame.
+        let f = layer.frame
+        var seen: [String] = []
+        for _ in 0..<6 {
+            if let shot = screenshot("gif") { seen.append(classify(pixel(shot, at: NSPoint(x: f.minX + 20, y: f.midY), w))) }
+            await sleep(0.07)
+        }
+        values["framesSeen"] = seen
+        check("E5 it plays: captures show several frames, all of them its own", Set(seen).count >= 2
+              && Set(seen).isSubset(of: ["R", "G", "B", "Y"]), seen)
+
+        press(124, right, arrow, w)
+        guard await displayed(v, timeout: 10) else { return check("big.gif displayed", false, nil) }
+        let big = playing(), frames = big?.values as? [CGImage] ?? []
+        let bytes = frames.reduce(0) { $0 + $1.bytesPerRow * $1.height }
+        values["bigGIF"] = "\(frames.count) frames of \(frames.first.map { "\($0.width)x\($0.height)" } ?? "-"), \(bytes >> 20) MB"
+        let pixels = frames.reduce(0) { $0 + $1.width * $1.height * 4 }
+        check("E5 big.gif (288 MB at full size): all 30 frames, shrunk to frames × w × h × 4 within 256 MB", frames.count == 30
+              && pixels <= 256 << 20 && pixels > 240 << 20 && frames.allSatisfy { $0.width < 2000 } && abs((big?.duration ?? 0) - 1.5) < 1e-9,
+              values["bigGIF"])
+        check("E5 big.gif laid out at its full size", v.canvas.imageSize == CGSize(width: 2000, height: 1200), v.canvas.imageSize)
+        press(119, end, .function, w) // still.gif, past long.gif
+        guard await displayed(v) else { return check("still.gif displayed", false, nil) }
+        check("E5 a 1-frame GIF is still: no animation, its picture", playing() == nil && layer.animationKeys()?.contains("frames") != true
+              && currentImage(v).map { classify(pixel($0, x: 0.1, yFromTop: 0.5)) } == "G", layer.animationKeys())
+        press(115, home, .function, w)
+        check("back on anim.gif (cached): playing again", v.index == 0 && shownURL == v.images[0] && playing()?.values?.count == 4, nil)
+
+        // Flying onto long.gif (500 frames of 800×800, shrunk under 256 MB to less than the 384 px fast thumbnail) with no
+        // strip thumbnail and no decode cached: the fast thumbnail stands in, then the animation replaces it and plays.
+        let long = v.images[2]
+        await wait(10) { screenDecodes[long] != nil } // its preload from launch
+        v.controls.strip.cache.removeAllObjects()
+        uncache(long)
+        press(124, right, arrow, w) // big.gif, from the cache
+        press(124, right, arrow, w, repeat: true)
+        let still = await wait(2) { v.displayedURL == long && v.shown?.frames.isEmpty == true }
+        let stand = v.shown?.longEdge ?? 0
+        let plays = await wait(10) { playing()?.values?.count == 500 }
+        values["longGIF"] = "still \(stand) px, then \(v.shown.map { "\($0.frames.count) frames of \($0.longEdge) px" } ?? "-")"
+        check("E5 flying onto long.gif: its fast thumbnail, then its 500 smaller frames replace it and play", still && plays
+              && v.index == 2 && shownURL == long && (v.shown?.longEdge ?? .max) < stand
+              && v.canvas.imageSize == CGSize(width: 800, height: 800), values["longGIF"])
+    }
+
+    private static func classify(_ c: (r: Double, g: Double, b: Double, a: Double)) -> String {
+        switch (c.r > 0.6, c.g > 0.6, c.b > 0.6) {
+        case (true, false, false) where c.g < 0.4 && c.b < 0.4: return "R"
+        case (false, true, false) where c.r < 0.4 && c.b < 0.4: return "G"
+        case (false, false, true) where c.r < 0.4 && c.g < 0.4: return "B"
+        case (true, true, false) where c.b < 0.4: return "Y"
+        default: return String(format: "?%.2f,%.2f,%.2f", c.r, c.g, c.b)
+        }
+    }
+
+    /// This process's power assertions, from `pmset -g assertions`.
+    private static func assertions() -> String {
+        let p = Process(), pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["-g", "assertions"]
+        p.standardOutput = pipe
+        try? p.run()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        return out.split(separator: "\n").filter { $0.contains("pid \(getpid())(") }.joined(separator: "\n")
+    }
+
+    /// Main-thread heartbeat: a 4 ms timer whose gaps show how long the main thread was busy.
+    private static var beats: [Double] = []
+    private static var beatTimer: Timer?
+    private static var onBeat: (() -> Void)?
+
+    private static func startHeartbeat() {
+        beats = []
+        let timer = Timer(timeInterval: 0.004, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                beats.append(now)
+                onBeat?()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        beatTimer = timer
+    }
+
+    private static func stopHeartbeat() -> (max: Double, p95: Double, beats: Int) {
+        beatTimer?.invalidate()
+        let gaps = zip(beats.dropFirst(), beats).map { $0 - $1 }.sorted()
+        guard !gaps.isEmpty else { return (1, 1, 0) }
+        return (gaps.last!, gaps[Int(Double(gaps.count - 1) * 0.95)], beats.count)
+    }
+
+    /// This process's phys_footprint, resident size and peak resident size (getrusage), in bytes.
+    private static func memory() -> (footprint: Double, resident: Double, peak: Double) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        guard result == KERN_SUCCESS else { return (-1, -1, -1) }
+        return (Double(info.phys_footprint), Double(info.resident_size), Double(usage.ru_maxrss))
+    }
+
+    /// Cells whose drawn center (presentation layers, through the scrolled content) is off cellFrame, the model that
+    /// the centering checks use.
+    private static func drawnOff(_ s: ThumbnailStrip) -> [Int] {
+        let c = s.content.presentation() ?? s.content
+        return s.cells.filter { i, cell in
+            let p = (cell.presentation() ?? cell).position, f = s.cellFrame(i)
+            let x = c.position.x - c.bounds.width / 2 + p.x - c.bounds.minX
+            let y = c.position.y - c.bounds.height / 2 + p.y - c.bounds.minY
+            return abs(x - f.midX) > 0.5 || abs(y - f.midY) > 0.5
+        }.keys.sorted()
+    }
+
+    /// Every cell with a picture shows the cached thumbnail of its own file: a late result never lands in another cell.
+    private static func checkOwnThumbs(_ s: ThumbnailStrip, _ stage: String) {
+        let wrong = s.cells.filter { i, cell in
+            cell.contents.map { $0 as AnyObject !== s.cache.object(forKey: s.images[i] as NSURL)?.image } ?? false
+        }.keys.sorted()
+        check("\(stage): every cell shows its own file's thumbnail", wrong.isEmpty, wrong)
+    }
+
     /// A click as a control's tracking loop sees it: the mouse-up waits in the event queue, then the mouse-down goes
     /// to the window, so the loop it starts reads that release. (Posting both raced: the loop could end without it.)
     private static func postClick(_ point: NSPoint, _ window: NSWindow) {
@@ -1386,15 +2178,20 @@ enum SelfTest {
         }
     }
 
+    /// Drops a file's screen-size decode, so the next visit decodes it (preloading would otherwise have it ready).
+    private static func uncache(_ url: URL) { viewer?.loader.cache.removeObject(forKey: url as NSURL) }
+
     private static func orientedSize(_ url: URL) -> CGSize {
         CGImageSourceCreateWithURL(url as CFURL, nil).flatMap(ImageLoader.orientedSize) ?? .zero
     }
 
-    /// Opens a fixture through the Finder path and waits until it is decoded and laid out.
+    /// Opens a fixture through the Finder path and waits until its decode (not a fast thumbnail) is on screen.
     private static func open(_ name: String, size: CGSize) async -> Bool {
+        let shows = shownCount
         app?.application(NSApp, open: [fixtures.appendingPathComponent(name)])
         let ok = await wait(5) {
-            viewer?.currentURL?.lastPathComponent == name && viewer?.canvas.imageSize == size && viewer.flatMap(currentImage) != nil
+            shownCount > shows && shownURL?.lastPathComponent == name && viewer?.currentURL?.lastPathComponent == name
+                && viewer?.canvas.imageSize == size && viewer.flatMap(currentImage) != nil
         }
         if !ok { check("\(name) loads", false, viewer?.canvas.imageSize) }
         return ok
@@ -1454,6 +2251,16 @@ enum SelfTest {
     private static func press(_ code: UInt16, _ chars: String, _ modifiers: NSEvent.ModifierFlags, _ window: NSWindow,
                               repeat isARepeat: Bool = false) {
         window.sendEvent(key(code, chars, modifiers, window, repeat: isARepeat))
+    }
+
+    /// While set, key-downs pass the real-input filter (NSApp.sendEvent runs local monitors; window.sendEvent doesn't).
+    private static var sendingKey = false
+
+    /// A key through NSApp, the path real keystrokes take.
+    private static func sendKey(_ event: NSEvent) {
+        sendingKey = true
+        NSApp.sendEvent(event)
+        sendingKey = false
     }
 
     /// A scroll event like the window server's: line units for a wheel notch, pixels plus phases for a trackpad.
@@ -1541,9 +2348,10 @@ enum SelfTest {
     }
 
     /// Pointer motion to `point` (window coordinates). The overlay hears motion through an always-active tracking
-    /// area, which AppKit only feeds from window-server events, so the synthesized event goes to its handler directly.
-    private static func move(_ point: NSPoint, _ v: ViewerController) {
-        v.controls.mouseMoved(with: NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: now,
+    /// area, which AppKit only feeds from window-server events, so the synthesized event goes to its handler directly
+    /// (or to `view`'s, e.g. the strip's, which passes it on to the overlay).
+    private static func move(_ point: NSPoint, _ v: ViewerController, into view: NSView? = nil) {
+        (view ?? v.controls).mouseMoved(with: NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: now,
                                                        windowNumber: v.window.windowNumber, context: nil, eventNumber: synthetic,
                                                        clickCount: 0, pressure: 0)!)
     }

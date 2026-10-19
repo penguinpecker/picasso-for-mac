@@ -12,7 +12,7 @@ OUT="$BUILD/test-results"
 LOCK="$BUILD/.gui-lock"
 ALL=(window screen2 fit exif formats large blur opacity click edgeclick esc escearly cmdw cmdq activate argv odoc folder
      panel emptyfolder odocempty panelodoc corrupt rapid screenchange index keys wheel stale secondopen
-     zoomkeys zoompoint zoommode pan rotate dblclick bar slideshow autohide label)
+     zoomkeys zoompoint zoommode pan rotate dblclick bar slideshow autohide label strip thumbs fly flypng flypnghidden gif)
 mkdir -p "$BUILD" "$OUT"
 
 # One GUI run at a time (stale locks from dead processes are reclaimed).
@@ -38,7 +38,12 @@ if [ "$(cat "$FIX/.stamp" 2>/dev/null)" != "$STAMP" ]; then
 fi
 
 APP="$("$ROOT/Scripts/build.sh" selftest)" || { echo "BUILD FAILED"; exit 1; }
-BIN="$APP/Contents/MacOS/Lightbox"
+BIN="$APP/Contents/MacOS/Picasso"
+
+# Asleep display or locked session: every scenario would fail for no reason, so say that instead.
+PICASSO_SELFTEST=preflight perl -e 'alarm shift; exec @ARGV' 10 "$BIN"; rc=$?
+if [ $rc -eq 2 ]; then echo "display asleep/locked — GUI tests cannot run"; exit 2; fi
+[ $rc -ne 0 ] && { echo "preflight failed (exit $rc)"; exit 1; }
 
 # Files outside the read-only-checked fixtures: LaunchServices stamps com.apple.lastuseddate#PS on
 # documents it opens, so LaunchServices scenarios get a copy; plus a non-image named like a JPEG
@@ -56,13 +61,18 @@ BEFORE="$(snapshot)"
 if [ $# -gt 0 ]; then SCENARIOS=("$@"); else SCENARIOS=("${ALL[@]}"); fi
 PASSED=0; FAILED=()
 for s in "${SCENARIOS[@]}"; do
-  L="$FIX/01-landscape.jpg"; LS_ARG=""
+  L="$FIX/01-landscape.jpg"; LS_ARG=""; LIMIT=30
   case "$s" in
     exif)   ARGS=("$FIX/04-exif6.jpg") ;;
     large)  ARGS=("$FIX/10-huge.jpg") ;;
     blur)   ARGS=(-backdropStyle blur "$L") ;;
     opacity) ARGS=(-backdropOpacity 0.1 "$L") ;;
     folder|keys|wheel|slideshow|label) ARGS=("$FIX/nav") ;;
+    strip)  ARGS=("$FIX/many") ;;
+    fly)    ARGS=("$FIX/many"); LIMIT=120 ;; # 1199 keys at 30 Hz
+    flypng) ARGS=("$FIX/plain") ;;
+    flypnghidden) ARGS=(-showThumbnails NO "$FIX/plain") ;;
+    gif)    ARGS=("$FIX/gif/anim.gif") ;;
     zoommode) ARGS=(-scrollWheelAction zoom "$L") ;;
     autohide) ARGS=("$FIX/02-portrait.jpg") ;;
     index)  ARGS=("$FIX/nav/img1.jpg") ;;
@@ -77,12 +87,12 @@ for s in "${SCENARIOS[@]}"; do
   start=$(date +%s)
   if [ -n "$LS_ARG" ]; then
     # Through LaunchServices like Finder (-g: stay in the background, -W: wait for exit).
-    perl -e 'alarm shift; exec @ARGV' 30 open -W -g -n -a "$APP" --env LIGHTBOX_SELFTEST="$s" \
-      --env LIGHTBOX_SELFTEST_OUT="$OUT" --env LIGHTBOX_FIXTURES="$FIX" \
+    perl -e 'alarm shift; exec @ARGV' 30 open -W -g -n -a "$APP" --env PICASSO_SELFTEST="$s" \
+      --env PICASSO_SELFTEST_OUT="$OUT" --env PICASSO_FIXTURES="$FIX" \
       --stdout "$OUT/$s.log" --stderr "$OUT/$s.log" "$LS_ARG"
   else
-    LIGHTBOX_SELFTEST="$s" LIGHTBOX_SELFTEST_OUT="$OUT" LIGHTBOX_FIXTURES="$FIX" LIGHTBOX_ODOC_FILE="$LS_FILE" \
-      perl -e 'alarm shift; exec @ARGV' 30 "$BIN" ${ARGS[@]+"${ARGS[@]}"} > "$OUT/$s.log" 2>&1
+    PICASSO_SELFTEST="$s" PICASSO_SELFTEST_OUT="$OUT" PICASSO_FIXTURES="$FIX" PICASSO_ODOC_FILE="$LS_FILE" \
+      perl -e 'alarm shift; exec @ARGV' "$LIMIT" "$BIN" ${ARGS[@]+"${ARGS[@]}"} > "$OUT/$s.log" 2>&1
   fi
   rc=$?
   # The alarm kills `open -W`, not the app LaunchServices started: never leave a hung test window up.

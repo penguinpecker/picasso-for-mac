@@ -1,0 +1,268 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		9609C4D4D82091256176604E /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 242F701073F2887D0DC80D47 /* AppDelegate.swift */; };
+		EA6A75DD8620E319EC6D69A4 /* ControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAFEAA889E7CFB1949B35083 /* ControlsOverlay.swift */; };
+		1DEBDFED3800A2651E3B8911 /* FolderIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77FDE4E263D38312BA8C00EA /* FolderIndex.swift */; };
+		A5414ACA1A0772BB419E9933 /* ImageCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFEF292E717E859F14DA3CBF /* ImageCanvasView.swift */; };
+		325147307F525D84A9F95EF0 /* ImageLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2CC65E390892C113133C31A /* ImageLoader.swift */; };
+		4EE8B992D79808BA5AFAFC77 /* SelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDA3D44DF4C4360D46619F8F /* SelfTest.swift */; };
+		C863DFCE7446D08B122BCE6B /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 014F03E627210915298B8D51 /* Settings.swift */; };
+		8DBFC7AC3E906E4ABCE6A740 /* ThumbnailStrip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39F4162EF291EBEFAF863676 /* ThumbnailStrip.swift */; };
+		F03DC807A987B74008EBAC9E /* ViewerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED584DD24DB18654D7915F45 /* ViewerController.swift */; };
+		82B036EE54E207ACE0B7F13B /* ViewerWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB526C48241DBAC6A9E3E52F /* ViewerWindow.swift */; };
+		248E356A262895881A33D823 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1897A9FB8B71C86CA11ECFA9 /* main.swift */; };
+		F11FAE3F4FF857C1039F23DD /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = 8DB851FC6458EDCA6F4E9B80 /* AppIcon.icns */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		D2A57DC1D883FD21FB995169 /* Picasso.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Picasso.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		242F701073F2887D0DC80D47 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		FAFEAA889E7CFB1949B35083 /* ControlsOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlsOverlay.swift; sourceTree = "<group>"; };
+		77FDE4E263D38312BA8C00EA /* FolderIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderIndex.swift; sourceTree = "<group>"; };
+		BFEF292E717E859F14DA3CBF /* ImageCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageCanvasView.swift; sourceTree = "<group>"; };
+		A2CC65E390892C113133C31A /* ImageLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageLoader.swift; sourceTree = "<group>"; };
+		DDA3D44DF4C4360D46619F8F /* SelfTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfTest.swift; sourceTree = "<group>"; };
+		014F03E627210915298B8D51 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
+		39F4162EF291EBEFAF863676 /* ThumbnailStrip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailStrip.swift; sourceTree = "<group>"; };
+		ED584DD24DB18654D7915F45 /* ViewerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerController.swift; sourceTree = "<group>"; };
+		EB526C48241DBAC6A9E3E52F /* ViewerWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerWindow.swift; sourceTree = "<group>"; };
+		1897A9FB8B71C86CA11ECFA9 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		8DB851FC6458EDCA6F4E9B80 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
+		3929905265571381EA452713 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DAF6AA633395B1B76148E35B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B19911C44BD755AB4F173858 = {
+			isa = PBXGroup;
+			children = (
+				CA452AC6DB53E1C10D6D7F5F /* Picasso */,
+				3936A56E033FE156B0D38F79 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CA452AC6DB53E1C10D6D7F5F /* Picasso */ = {
+			isa = PBXGroup;
+			children = (
+				242F701073F2887D0DC80D47 /* AppDelegate.swift */,
+				FAFEAA889E7CFB1949B35083 /* ControlsOverlay.swift */,
+				77FDE4E263D38312BA8C00EA /* FolderIndex.swift */,
+				BFEF292E717E859F14DA3CBF /* ImageCanvasView.swift */,
+				A2CC65E390892C113133C31A /* ImageLoader.swift */,
+				DDA3D44DF4C4360D46619F8F /* SelfTest.swift */,
+				014F03E627210915298B8D51 /* Settings.swift */,
+				39F4162EF291EBEFAF863676 /* ThumbnailStrip.swift */,
+				ED584DD24DB18654D7915F45 /* ViewerController.swift */,
+				EB526C48241DBAC6A9E3E52F /* ViewerWindow.swift */,
+				1897A9FB8B71C86CA11ECFA9 /* main.swift */,
+				8DB851FC6458EDCA6F4E9B80 /* AppIcon.icns */,
+				3929905265571381EA452713 /* Info.plist */,
+			);
+			path = Picasso;
+			sourceTree = "<group>";
+		};
+		3936A56E033FE156B0D38F79 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				D2A57DC1D883FD21FB995169 /* Picasso.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		42AEFBAE01D2DFD981F7DA7D /* Picasso */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B96B5D8575283A646261690A /* Build configuration list for PBXNativeTarget "Picasso" */;
+			buildPhases = (
+				0F78FE532035D122ED352DBA /* Sources */,
+				DAF6AA633395B1B76148E35B /* Frameworks */,
+				943E4BBD9B51C81965501BA3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Picasso;
+			productName = Picasso;
+			productReference = D2A57DC1D883FD21FB995169 /* Picasso.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		46F86FAA6BBF9AC94A7E4595 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = 9873F885523C5B8D7C91F5AE /* Build configuration list for PBXProject "Picasso" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = B19911C44BD755AB4F173858;
+			productRefGroup = 3936A56E033FE156B0D38F79 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				42AEFBAE01D2DFD981F7DA7D /* Picasso */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		943E4BBD9B51C81965501BA3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F11FAE3F4FF857C1039F23DD /* AppIcon.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0F78FE532035D122ED352DBA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9609C4D4D82091256176604E /* AppDelegate.swift in Sources */,
+				EA6A75DD8620E319EC6D69A4 /* ControlsOverlay.swift in Sources */,
+				1DEBDFED3800A2651E3B8911 /* FolderIndex.swift in Sources */,
+				A5414ACA1A0772BB419E9933 /* ImageCanvasView.swift in Sources */,
+				325147307F525D84A9F95EF0 /* ImageLoader.swift in Sources */,
+				4EE8B992D79808BA5AFAFC77 /* SelfTest.swift in Sources */,
+				C863DFCE7446D08B122BCE6B /* Settings.swift in Sources */,
+				8DBFC7AC3E906E4ABCE6A740 /* ThumbnailStrip.swift in Sources */,
+				F03DC807A987B74008EBAC9E /* ViewerController.swift in Sources */,
+				82B036EE54E207ACE0B7F13B /* ViewerWindow.swift in Sources */,
+				248E356A262895881A33D823 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		6F0B85FC643AF9C218F627EA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		1B05A9D10F61E514E88AF240 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		CB8FE7DDB06B8A28E578DE77 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Picasso/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.penguinpecker.Picasso;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		C049B1C2A83F1767ABF6526D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Picasso/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.penguinpecker.Picasso;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9873F885523C5B8D7C91F5AE /* Build configuration list for PBXProject "Picasso" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6F0B85FC643AF9C218F627EA /* Debug */,
+				1B05A9D10F61E514E88AF240 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B96B5D8575283A646261690A /* Build configuration list for PBXNativeTarget "Picasso" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CB8FE7DDB06B8A28E578DE77 /* Debug */,
+				C049B1C2A83F1767ABF6526D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 46F86FAA6BBF9AC94A7E4595 /* Project object */;
+}

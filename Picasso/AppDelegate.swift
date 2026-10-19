@@ -74,16 +74,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if response == .OK, let url = panel.url { open(url) } else if viewer == nil { NSApp.terminate(nil) }
     }
 
+    @objc private func openSettings(_ sender: Any?) { Settings.show() }
+
     @objc private func closeViewer(_ sender: Any?) {
+        // ⌘W in the settings window closes just that window.
+        if let key = NSApp.keyWindow, key !== viewer?.window { key.performClose(sender); return }
         if let viewer { viewer.close() } else { NSApp.terminate(nil) }
     }
 
     /// Never visible (accessory app), but provides the key equivalents.
     private func makeMainMenu() -> NSMenu {
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings(_:)), keyEquivalent: ",")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Close", action: #selector(closeViewer(_:)), keyEquivalent: "w")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Lightbox", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit Picasso", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         // Edit items give the open panel's text fields (Go to Folder, search) ⌘X/⌘C/⌘V/⌘A.
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")

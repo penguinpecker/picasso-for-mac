@@ -38,15 +38,38 @@ final class ImageCanvasView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    func setImage(_ image: CGImage?, pixelSize: CGSize, rotation: Int) {
-        imageSize = pixelSize
+    /// A new image, laid out at fit by its full size, whatever the size of the pixels (a thumbnail, a downsampled decode).
+    func setImage(_ decoded: Decoded?, rotation: Int) {
+        imageSize = decoded?.pixelSize ?? .zero
         self.rotation = rotation
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        imageLayer.contents = image
-        CATransaction.commit()
+        setPixels(decoded)
         fit(animated: false)
     }
+
+    /// Other pixels for the image shown (a sharper decode): same layout. An animation plays its frames on a loop.
+    func setPixels(_ decoded: Decoded?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        imageLayer.removeAnimation(forKey: "frames")
+        imageLayer.contents = decoded?.image
+        imageLayer.opacity = 1
+        if let decoded, !decoded.frames.isEmpty {
+            let total = decoded.delays.reduce(0, +)
+            var start = 0.0
+            let frames = CAKeyframeAnimation(keyPath: "contents")
+            frames.values = decoded.frames
+            // Discrete: one more key time than values, each frame starting at the sum of the delays before it.
+            frames.keyTimes = ([0] + decoded.delays.map { start += $0; return start }).map { NSNumber(value: $0 / total) }
+            frames.calculationMode = .discrete
+            frames.duration = total
+            frames.repeatCount = .infinity
+            imageLayer.add(frames, forKey: "frames")
+        }
+        CATransaction.commit()
+    }
+
+    /// The image being left fades back while the next one loads.
+    func dim() { imageLayer.opacity = 0.4 } // implicit animation
 
     /// The window resizes when its screen changes (resolution change, display unplugged): re-fit.
     override func setFrameSize(_ newSize: NSSize) {

@@ -8,24 +8,39 @@ final class ViewerController: NSViewController {
     let canvas: ImageCanvasView
     private(set) var backdrop = NSView()
     private(set) lazy var controls = ControlsOverlay(target: self)
+    let loader = ImageLoader()
     /// The folder being viewed, in Finder order, and the position in it.
     private(set) var images: [URL] = []
     private(set) var index = 0
-    /// The image last asked for; a decode that finishes for any other URL is stale and dropped.
+    /// The image last asked for.
     private(set) var currentURL: URL?
-    /// The image on screen (lags `currentURL` while a decode is in flight).
+    /// Bumped by every navigation: a result asked for under an older one is stale and dropped.
+    private var generation = 0
+    /// The image on screen (lags `currentURL` until something of it can be shown), the generation it was laid out
+    /// for, and its pixels (fast thumbnail, screen-size or full-resolution decode).
     private(set) var displayedURL: URL?
+    private var displayedGeneration = -1
+    private(set) var shown: Decoded?
+    private var lastNavigation = 0.0
+    /// Starts the decode where the user stops: debounced while flying through the folder.
+    private var landing: Timer?
+    private var fullResolutionRequested = false
     /// View-only rotations for this session, never saved.
     private var rotations: [URL: Int] = [:]
     /// Seconds per slide (the self-test shortens it); the slideshow is running while its timer exists.
     var slideshowInterval: TimeInterval = 3
     private(set) var slideshow: Timer?
-    /// Precise scroll accumulated over the current trackpad gesture (or smooth-mouse run), and whether the gesture navigated.
+    /// Keeps the display awake while the slideshow plays.
+    private(set) var slideshowActivity: NSObjectProtocol?
+    /// Precise scroll accumulated over the current trackpad gesture (or smooth-mouse run), whether the gesture navigated,
+    /// and whether the last precise event was part of a gesture (has phases) or of a smooth-mouse run.
     private var swipe = CGPoint.zero
     private var swiped = false
+    private var inGesture = false
     /// Shown in place of the image when a file can't be decoded.
     let message = ClickThroughLabel(labelWithString: "")
     private var isClosing = false
+    private var backdropSettings: [NSKeyValueObservation] = []
 
     init() {
         let screen = Self.cursorScreen
@@ -49,6 +64,10 @@ final class ViewerController: NSViewController {
         canvas.onDrag = { [weak self] event in self?.controls.mouseMoved(with: event) }
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        backdropSettings = [UserDefaults.standard.observe(\.backdropOpacity) { [weak self] _, _ in
+                                DispatchQueue.main.async { self?.installBackdrop() } },
+                            UserDefaults.standard.observe(\.backdropStyle) { [weak self] _, _ in
+                                DispatchQueue.main.async { self?.installBackdrop() } }]
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -58,9 +77,11 @@ final class ViewerController: NSViewController {
         return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
     }
 
-    /// Keeps covering the screen after a resolution change; if that screen is gone, moves to the cursor's.
+    /// Keeps covering the screen after a resolution change; if that screen is gone, moves to the cursor's. A sharper
+    /// screen gets a bigger decode.
     @objc private func screensChanged() {
         window.setFrame((window.screen ?? Self.cursorScreen).frame, display: true)
+        land()
     }
 
     override func loadView() {
@@ -113,7 +134,9 @@ final class ViewerController: NSViewController {
         let frame = Self.cursorScreen.frame
         if window.frame != frame { window.setFrame(frame, display: true) }
         self.images = images
+        controls.strip.images = images
         currentURL = nil
+        loader.cache.removeObject(forKey: images[index] as NSURL)
         go(to: index)
     }
 
@@ -122,34 +145,104 @@ final class ViewerController: NSViewController {
         guard !images.isEmpty else { return }
         index = min(max(i, 0), images.count - 1)
         controls.update(name: images[index].lastPathComponent, index: index, count: images.count)
+        controls.strip.select(index)
         if slideshow != nil { scheduleSlide() } // manual navigation restarts the countdown
         load(images[index])
     }
 
-    /// Decodes off the main thread; the window appears (animated) once the first image is ready.
+    /// Shows `url`: its screen-size decode at once if cached; else, when flying through the folder (steps under 0.25 s
+    /// apart, as with key repeat), a thumbnail: the strip's at once if it has one, else a fast one once decoded (the
+    /// image being left stays meanwhile, dimmed). Decoding starts where the user stops: at once for a single step,
+    /// debounced while flying, so each step costs the main thread next to nothing.
     private func load(_ url: URL) {
         guard url != currentURL else { return }
         currentURL = url
+        generation += 1
+        fullResolutionRequested = false
         message.isHidden = true // a can't-open message belongs to the file being left
         #if SELFTEST
         SelfTest.loadCount += 1
         #endif
-        let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
-        let maxPixel = Int(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor)
-        ImageLoader.load(url, maxPixelSize: maxPixel) { [weak self] decoded in
-            #if SELFTEST
-            SelfTest.decodeCallbacks += 1
-            #endif
-            guard let self, self.currentURL == url else { return } // the user moved on: drop the stale result
-            displayedURL = url
-            canvas.setImage(decoded?.image, pixelSize: decoded?.pixelSize ?? .zero, rotation: rotations[url] ?? 0)
-            #if SELFTEST
-            SelfTest.shownURL = url
-            #endif
-            message.stringValue = "Can’t open “\(url.lastPathComponent)”"
-            message.isHidden = decoded != nil
-            if !window.isVisible { present() }
+        let time = ProcessInfo.processInfo.systemUptime, flying = time - lastNavigation < 0.25
+        lastNavigation = time
+        loader.moved(to: url)
+        landing?.invalidate()
+        if let cached = loader.cached(url, maxPixelSize: screenPixels) {
+            display(cached, url)
+        } else if flying, window.isVisible, let thumbnail = controls.strip.cache.object(forKey: url as NSURL) {
+            showPreview(thumbnail, url)
+        } else if window.isVisible {
+            canvas.dim()
+            if flying {
+                let generation = generation
+                loader.loadPreview(url) { [weak self] preview in
+                    guard let self, generation == self.generation, displayedGeneration != generation, let preview else { return }
+                    showPreview(preview, url)
+                }
+            }
         }
+        if flying {
+            landing = Timer.scheduledTimer(timeInterval: 0.1, target: self, selector: #selector(land), userInfo: nil, repeats: false)
+        } else {
+            land()
+        }
+    }
+
+    /// A thumbnail standing in for `url` while flying past, laid out by the image's full size.
+    private func showPreview(_ preview: Decoded, _ url: URL) {
+        canvas.setImage(preview, rotation: rotations[url] ?? 0)
+        displayedGeneration = generation
+        displayedURL = url
+        shown = preview
+        #if SELFTEST
+        SelfTest.previewShown(url)
+        #endif
+    }
+
+    /// The user stopped on the current image: decode it if needed, then preload two neighbors each way.
+    @objc private func land() {
+        guard let url = currentURL else { return }
+        let generation = generation
+        loader.colorSpace = window.colorSpace?.cgColorSpace
+        loader.load(url, maxPixelSize: screenPixels) { [weak self] decoded in
+            guard let self, generation == self.generation else {
+                #if SELFTEST
+                SelfTest.staleDropped += 1
+                #endif
+                return
+            }
+            if displayedGeneration != generation || decoded !== shown { display(decoded, url) }
+            let neighbors = [index + 1, index + 2, index - 1, index - 2].filter(images.indices.contains).map { self.images[$0] }
+            loader.preload(neighbors, maxPixelSize: screenPixels)
+        }
+    }
+
+    /// Puts a decode of `url` on screen: in place of a smaller version shown for this visit, else laid out fresh at fit.
+    /// nil: the can't-open message. The window appears (animated) with the first image.
+    private func display(_ decoded: Decoded?, _ url: URL) {
+        if displayedGeneration == generation, let decoded {
+            // A late, smaller decode never replaces a sharper one, but an animation (maybe shrunk to fit in memory,
+            // smaller than the still shown while flying) always replaces a still.
+            guard !decoded.frames.isEmpty || decoded.longEdge >= shown?.longEdge ?? 0 else { return }
+            canvas.setPixels(decoded)
+        } else {
+            canvas.setImage(decoded, rotation: rotations[url] ?? 0)
+        }
+        displayedGeneration = generation
+        displayedURL = url
+        shown = decoded
+        #if SELFTEST
+        SelfTest.shownURL = url
+        #endif
+        message.stringValue = "Can’t open “\(url.lastPathComponent)”"
+        message.isHidden = decoded != nil
+        if !window.isVisible { present() }
+    }
+
+    /// The screen's long edge in pixels: a screen-size decode has no more.
+    private var screenPixels: Int {
+        let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        return Int(max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor)
     }
 
     private func present() {
@@ -174,6 +267,7 @@ final class ViewerController: NSViewController {
     func close() {
         guard !isClosing else { return }
         isClosing = true
+        stopSlideshow()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.15
             window.animator().alphaValue = 0
@@ -189,6 +283,7 @@ final class ViewerController: NSViewController {
         case (53, _, _): close() // Esc
         case (_, true, "w"): close()
         case (_, true, "q"): NSApp.terminate(nil)
+        case (_, true, ","): Settings.show()
         case (123, _, _): go(to: index - 1) // ←
         case (124, _, _), (49, _, _): go(to: index + 1) // →, Space
         case (115, _, _): go(to: 0) // Home, also Fn+←
@@ -210,6 +305,12 @@ final class ViewerController: NSViewController {
         let sign: CGFloat = event.isDirectionInvertedFromDevice ? 1 : -1
         let delta = CGPoint(x: event.scrollingDeltaX * sign, y: event.scrollingDeltaY * sign)
         let gesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty // trackpad
+        if event.hasPreciseScrollingDeltas {
+            // Each gesture starts over, also one begun with ⌘ (so before the zoom return), and smooth-mouse runs and
+            // gestures never inherit each other's leftovers.
+            if event.phase.contains(.began) || gesture != inGesture { swipe = .zero; swiped = false }
+            inGesture = gesture
+        }
         if event.modifierFlags.contains(.command) || (!gesture && Settings.scrollWheelAction == "zoom") {
             // Zoom at the cursor, up = in: a wheel notch is one zoom step, precise deltas zoom smoothly.
             guard delta.y != 0 else { return }
@@ -237,7 +338,6 @@ final class ViewerController: NSViewController {
             return
         }
         // Trackpad: one image per horizontal swipe, fingers moving left = next. Momentum never navigates.
-        if event.phase.contains(.began) { swipe = .zero; swiped = false }
         guard event.momentumPhase.isEmpty, !swiped else { return }
         swipe.x += delta.x
         swipe.y += delta.y
@@ -261,13 +361,19 @@ final class ViewerController: NSViewController {
     @objc func zoomSliderMoved(_ slider: NSSlider) { canvas.zoomPosition = slider.doubleValue }
 
     @objc func toggleSlideshow() {
-        if let slideshow {
-            slideshow.invalidate()
-            self.slideshow = nil
-        } else {
-            scheduleSlide()
-        }
-        controls.showPlaying(slideshow != nil)
+        guard slideshow == nil else { return stopSlideshow() }
+        scheduleSlide()
+        slideshowActivity = ProcessInfo.processInfo.beginActivity(options: [.idleDisplaySleepDisabled, .userInitiated],
+                                                                  reason: "Slideshow")
+        controls.showPlaying(true)
+    }
+
+    private func stopSlideshow() {
+        slideshow?.invalidate()
+        slideshow = nil
+        if let slideshowActivity { ProcessInfo.processInfo.endActivity(slideshowActivity) }
+        slideshowActivity = nil
+        controls.showPlaying(false)
     }
 
     private func scheduleSlide() {
@@ -287,7 +393,18 @@ final class ViewerController: NSViewController {
     }
 
     private func zoomChanged() {
-        controls.showZoom(position: canvas.zoomPosition, isFit: canvas.isFit, zoomedIn: canvas.scale > canvas.fitScale)
+        controls.showZoom(position: canvas.zoomPosition, isFit: canvas.isFit, zoomedIn: canvas.scale > canvas.fitScale,
+                          canToggle: !(canvas.isFit && canvas.fitScale == 1))
+        // Zoomed in past what a screen-size decode holds: swap in every pixel (kept until the next image).
+        let longEdge = max(canvas.imageSize.width, canvas.imageSize.height), limit = CGFloat(screenPixels)
+        guard let url = currentURL, displayedGeneration == generation, !fullResolutionRequested, longEdge > limit,
+              longEdge * canvas.scale * window.backingScaleFactor > limit else { return }
+        fullResolutionRequested = true
+        let generation = generation
+        loader.loadFullResolution(url) { [weak self] full in
+            guard let self, generation == self.generation, let full else { return }
+            display(full, url)
+        }
     }
 }
 
